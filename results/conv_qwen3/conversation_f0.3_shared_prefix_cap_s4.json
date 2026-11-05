@@ -1,0 +1,73 @@
+{
+ "router": {
+  "policy": "prefix_cap",
+  "cap": 16384,
+  "sent": [
+   126,
+   122,
+   119,
+   114
+  ],
+  "pending": [
+   0,
+   0,
+   0,
+   0
+  ],
+  "cached_blocks": [
+   276,
+   276,
+   276,
+   276
+  ]
+ },
+ "backends": [
+  "http://localhost:8100",
+  "http://localhost:8101",
+  "http://localhost:8102",
+  "http://localhost:8103"
+ ],
+ "model": "Qwen/Qwen3-8B",
+ "trace": "conversation",
+ "start": 600,
+ "dur": 600.0,
+ "frac": 0.3,
+ "seed": 0,
+ "speed": 4.0,
+ "out": "results/conv_qwen3/conversation_f0.3_shared_prefix_cap_s4.csv",
+ "wall": 213.71732107701246,
+ "counters": [
+  {
+   "vllm:prefix_cache_queries_total": 1170904.0,
+   "vllm:prefix_cache_hits_total": 105472.0,
+   "vllm:external_prefix_cache_queries_total": 1065432.0,
+   "vllm:external_prefix_cache_hits_total": 45056.0,
+   "vllm:prompt_tokens_total": 1170904.0,
+   "vllm:generation_tokens_total": 42890.0
+  },
+  {
+   "vllm:prefix_cache_queries_total": 1119702.0,
+   "vllm:prefix_cache_hits_total": 138752.0,
+   "vllm:external_prefix_cache_queries_total": 980950.0,
+   "vllm:external_prefix_cache_hits_total": 28672.0,
+   "vllm:prompt_tokens_total": 1119702.0,
+   "vllm:generation_tokens_total": 46853.0
+  },
+  {
+   "vllm:prefix_cache_queries_total": 1109176.0,
+   "vllm:prefix_cache_hits_total": 80384.0,
+   "vllm:external_prefix_cache_queries_total": 1028792.0,
+   "vllm:external_prefix_cache_hits_total": 71680.0,
+   "vllm:prompt_tokens_total": 1109176.0,
+   "vllm:generation_tokens_total": 39840.0
+  },
+  {
+   "vllm:prefix_cache_queries_total": 1072463.0,
+   "vllm:prefix_cache_hits_total": 138880.0,
+   "vllm:external_prefix_cache_queries_total": 933583.0,
+   "vllm:external_prefix_cache_hits_total": 9216.0,
+   "vllm:prompt_tokens_total": 1072463.0,
+   "vllm:generation_tokens_total": 40574.0
+  }
+ ]
+}

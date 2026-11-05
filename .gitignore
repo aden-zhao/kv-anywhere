@@ -1,0 +1,6 @@
+traces/
+__pycache__/
+results/*/logs/
+results/*.out
+results/debug/
+results/invalid_*/
