@@ -28,15 +28,32 @@ def summarize(path):
     local = sum(x["vllm:prefix_cache_hits_total"] for x in c)
     ext = sum(x["vllm:external_prefix_cache_hits_total"] for x in c)
     prompt = [x["vllm:prompt_tokens_total"] for x in c]
-    mode, policy = re.search(r"_f[\d.]+_(gpu|private|shared)_(\w+?)_s[\d.]+\.csv$", path).groups()
+    if meta.get("mode"):  # newer runs record their labels
+        mode, policy = meta["mode"], meta["policy"]
+    else:
+        mode, policy = re.search(r"_f[\d.]+_(gpu|private|shared)_(\w+?)_s[\d.]+\.csv$", path).groups()
+    load = meta["agents"] if meta.get("trace") == "agents" else meta["speed"]
     return dict(
-        run=os.path.basename(path)[:-4], mode=mode, policy=policy, speed=meta["speed"],
+        run=os.path.basename(path)[:-4], mode=mode, policy=policy, speed=load, tier_gb=meta.get("tier_gb"),
         n=len(rows), failed=len(rows) - len(ttft),
         p50=pct(ttft, 0.5), p90=pct(ttft, 0.9), p99=pct(ttft, 0.99),
         mean=sum(ttft) / max(1, len(ttft)),
         gpu_hit=local / queries if queries else 0, tier_hit=ext / queries if queries else 0,
         imbalance=max(prompt) / (sum(prompt) / len(prompt)) if sum(prompt) else 0,
-        sent="/".join(str(s) for s in meta["router"]["sent"]))
+        sent="/".join(str(s) for s in meta["router"]["sent"]),
+        **(agent_times(rows) if meta.get("trace") == "agents" else {}))
+
+
+def agent_times(rows):
+    """Closed-loop runs: how long each agent took from its first step to its last."""
+    span = {}
+    for r in rows:
+        t0, t1 = float(r["sent"]), float(r["sent"]) + float(r["e2e"])
+        a, b = span.get(r["session"], (t0, t1))
+        span[r["session"]] = (min(a, t0), max(b, t1))
+    times = [b - a for a, b in span.values()]
+    end = max(b for _, b in span.values())
+    return dict(session_mean=sum(times) / len(times), steps_per_s=len(rows) / end)
 
 
 def load(dirs):

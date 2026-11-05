@@ -80,13 +80,15 @@ def workload(name="toolagent", start_s=600, dur_s=600, frac=1.0, max_len=32768,
     return out
 
 
-def token_ids(req, lo=1000, hi=100000):
-    """Prompt token ids: one deterministic random block per hash id."""
-    toks = []
-    for h in req.hash_ids:
-        rng = random.Random(h)
-        toks.extend(rng.randrange(lo, hi) for _ in range(BLOCK))
-    return toks[:req.input_len]
+def block_tokens(h, lo=1000, hi=100000):
+    """The token ids for hash id h: a fixed random block, the same every time."""
+    rng = random.Random(h)
+    return [rng.randrange(lo, hi) for _ in range(BLOCK)]
+
+
+def token_ids(req):
+    """A request's prompt: its blocks' tokens, cut to its length."""
+    return [t for h in req.hash_ids for t in block_tokens(h)][:req.input_len]
 
 
 if __name__ == "__main__":

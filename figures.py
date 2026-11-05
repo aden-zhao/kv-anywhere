@@ -4,6 +4,7 @@
     python3 figures.py results/conv_qwen25 --out docs/figures [--speed 7]
 
 ttft.png    median and p99 TTFT vs load for the four main arms
+agents.png  (--agents) mean session time and throughput vs concurrent agents
 tokens.png  where each arm's prompt tokens came from at one load:
             GPU prefix cache, the KV tier, or recomputed
 """
@@ -96,14 +97,47 @@ def token_figure(rows, out, speed, arms):
     fig.savefig(out, dpi=160, facecolor=SURFACE)
 
 
+AGENT_ARMS = [("gpu", "least", "least-loaded, GPU only", "#2a78d6"),
+              ("gpu", "prefix", "prefix affinity, GPU only", "#eb6834"),
+              ("shared", "least", "least-loaded + /dev/shm tier", "#008300"),
+              ("shared", "prefix", "prefix affinity + /dev/shm tier", "#4a3aa7"),
+              ("lustre-big", "least", "least-loaded + big Lustre tier", "#eda100")]
+
+
+def agents_figure(rows, out):
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4), facecolor=SURFACE)
+    for ax, key, title, unit in [(axes[0], "session_mean", "Mean time to finish an agent session", "seconds"),
+                                 (axes[1], "steps_per_s", "Throughput", "agent steps per second")]:
+        style(ax)
+        for mode, pol, label, color in AGENT_ARMS:
+            pts = sorted((r["speed"], r[key]) for r in rows if r["mode"] == mode and r["policy"] == pol)
+            if pts:
+                xs, ys = zip(*pts)
+                ax.plot(xs, ys, color=color, linewidth=2, marker="o", markersize=5, label=label,
+                        markeredgecolor=SURFACE, markeredgewidth=1.5)
+        ax.set_xticks([16, 32, 48])
+        ax.set_xlabel("concurrent agents (4 GPUs)", color=INK2, fontsize=9)
+        ax.set_ylabel(unit, color=INK2, fontsize=9)
+        ax.set_title(title, color=INK, fontsize=11, loc="left")
+        ax.set_ylim(bottom=0)
+    axes[0].legend(frameon=False, fontsize=8, labelcolor=INK2, loc="upper left")
+    fig.tight_layout()
+    fig.savefig(out, dpi=160, facecolor=SURFACE)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dirs", nargs="+")
     ap.add_argument("--out", default="docs/figures")
     ap.add_argument("--speed", type=float, default=None)
+    ap.add_argument("--agents", action="store_true", help="agent sweep: draw agents.png only")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     rows = analyze.load(a.dirs)
+    if a.agents:
+        agents_figure(rows, f"{a.out}/agents.png")
+        print("wrote", a.out)
+        return
     speed = a.speed or max(r["speed"] for r in rows)
     ttft_figure(rows, f"{a.out}/ttft.png", ARMS)
     token_figure(rows, f"{a.out}/tokens.png", speed, ARMS)

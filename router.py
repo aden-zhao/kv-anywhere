@@ -13,6 +13,7 @@ POST /config {"policy": ..., "cap": ..., "capacity_blocks": ...} switches the
 policy and clears the router's state between runs. GET /stats shows the state.
 """
 import argparse
+import json
 
 import aiohttp
 from aiohttp import web
@@ -31,8 +32,8 @@ class Router:
         self.sent = [0] * len(self.backends)
 
     async def completions(self, request):
-        body = await request.json()
-        tokens = body["prompt"]
+        raw = await request.read()  # forwarded as-is: agent prompts can be ~1 MB of JSON
+        tokens = json.loads(raw)["prompt"]
         keys = policies.block_keys(tokens)
         j = policies.choose(self.policy, self.replicas, keys, self.cap)
         rep = self.replicas[j]
@@ -48,7 +49,8 @@ class Router:
         try:
             for attempt in range(2):
                 try:
-                    async with self.session.post(self.backends[j] + "/v1/completions", json=body) as up:
+                    async with self.session.post(self.backends[j] + "/v1/completions", data=raw,
+                                                 headers={"Content-Type": "application/json"}) as up:
                         async for chunk in up.content.iter_any():
                             if first:
                                 rep.pending -= miss

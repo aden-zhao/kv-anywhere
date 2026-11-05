@@ -69,12 +69,13 @@ def kv_capacity(url):
 
 def measure_prefill(a, rng):
     rows = []
-    for n in a.lens:  # `extend` sends 2n tokens, so 2n must fit in the 32k context
+    for n in a.lens:
         for _ in range(a.reps):
             p = prompt(rng, n)
+            more = min(n, a.max_ctx - n - 8)  # `extend` adds up to n tokens, within the context limit
             clear_caches(a.backend)
-            row = dict(n=n, compute=first_token_time(a.backend, a.model, p))
-            row["extend"] = first_token_time(a.backend, a.model, p + prompt(rng, n))
+            row = dict(n=n, m=more, compute=first_token_time(a.backend, a.model, p))
+            row["extend"] = first_token_time(a.backend, a.model, p + prompt(rng, more))
             row["gpu"] = first_token_time(a.backend, a.model, p)
             time.sleep(1.0)  # let the tier writes land
             clear_caches(a.backend)
@@ -86,9 +87,9 @@ def measure_prefill(a, rng):
 
 def measure_decode(a, rng):
     steps, cap = [], kv_capacity(a.backend)
-    for C, Bs in [(2048, [1, 8, 32, 96]), (8192, [1, 8, 32])]:
+    for C, Bs in [(2048, [1, 8, 32, 96]), (8192, [1, 8, 32]), (32768, [1, 4, 8])]:
         for B in Bs:
-            if B * (C + 128) > 0.8 * cap:  # vLLM would preempt; not a clean step
+            if B * (C + 128) > 0.8 * cap or C > a.max_ctx:  # would preempt, or doesn't fit
                 continue
             clear_caches(a.backend)
             steps.append(dict(B=B, C=C, step=step_time(a.backend, a.model, B, C, rng)))
@@ -103,8 +104,8 @@ def fit(X, y):
 def fit_prefill(rows):
     X, y = [], []
     for r in rows:
-        n = r["n"]
-        X += [[1, n, n * (0 + n / 2)], [1, n, n * (n + n / 2)]]  # ctx = 0, then ctx = n
+        n, m = r["n"], r.get("m", r["n"])
+        X += [[1, n, n * (0 + n / 2)], [1, m, m * (n + m / 2)]]  # n new after 0, then m new after n
         y += [r["compute"], r["extend"]]
     base, per_tok, attn = fit(X, y)
     load_base, load_per_tok = fit([[1, r["n"]] for r in rows], [r["tier"] - r["gpu"] for r in rows])
@@ -124,6 +125,7 @@ def main():
     ap.add_argument("--lens", type=int, nargs="+", default=[1024, 2048, 4096, 8192, 15360])
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--decode-only", action="store_true")
+    ap.add_argument("--max-ctx", type=int, default=32768)
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     rng = random.Random(1)

@@ -26,9 +26,10 @@ def block_keys(tokens, block=BLOCK):
 
 
 class Replica:
-    def __init__(self, capacity_blocks):
+    def __init__(self, capacity_blocks, fifo=False):
         self.pending = 0
         self.capacity = capacity_blocks
+        self.fifo = fifo  # evict oldest-written instead of least-recently-used
         self.cache = OrderedDict()
 
     def match(self, keys):
@@ -39,6 +40,8 @@ class Replica:
 
     def insert(self, keys):
         for k in keys:
+            if k in self.cache and self.fifo:
+                continue
             self.cache[k] = True
             self.cache.move_to_end(k)
         while len(self.cache) > self.capacity:

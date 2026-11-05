@@ -1,6 +1,6 @@
 # kv-anywhere
 
-Route LLM requests by load and let a shared KV tier supply the cached prefix, instead of routing each request to the replica that already caches it. 4 vLLM replicas on NERSC Perlmutter A100s, replaying real multi-turn traces.
+Route LLM requests by load and let a shared KV tier supply the cached prefix, instead of routing each request to the replica that already caches it. 4 vLLM replicas on NERSC Perlmutter A100s, replaying real chat and coding-agent traces.
 
 ## The idea
 
@@ -79,6 +79,47 @@ Bigger KV hurts the shared tier three ways: each tier load moves more bytes, the
 
 3 of the 13,468 requests in the main sweep failed with a dropped keep-alive connection between the router and vLLM; the router now retries those.
 
+## Long-horizon agents
+
+Chat is the easy case. A coding agent runs dozens of steps, each step's prompt is the previous prompt plus one tool result, and the context grows past 100k tokens. That changes the calculus:
+
+| | Conversation | Agent session |
+|---|---|---|
+| Context per request | ~9k tokens | median ~57k, up to 128k (longer sessions exist; we keep ≤128k) |
+| Shared with the previous request | partial | 99.6% (median) |
+| Cost of a cache miss | 0.57 s (8k tokens) | 24 s (120k tokens) |
+| KV per session | ~0.5 GB | 3–7 GB, so a GPU holds ~3–7 sessions |
+| Gap between requests | user think time | tool runs: median 1.7 s |
+
+**Workload.** FreeInference (Harvard, CC-BY-4.0) logs production coding agents (codex, opencode, ...) with session ids, start/end times, and ids for every 16-token block of every prompt. `agents.py` keeps sessions whose context peaks between 32k and 128k tokens (one day: 117 sessions, median 34 steps), regroups the block ids into the same 512-token chained ids, and replays them *closed loop*: an agent sends its next step only when the previous one finishes, plus the recorded tool gap (capped at 30 s). Each session runs its first 30 steps, with outputs capped at 256 tokens. The load knob is the number of concurrent agents. Serving uses Qwen2.5-7B with its 128k-context (YaRN) setting.
+
+**Where the tier lives.** The shared tier is either node-local memory (`/dev/shm`) or Lustre (Perlmutter's `$SCRATCH`), a distributed file system every node can read, like DeepSeek's storage cluster in miniature. For a 120k-token prompt:
+
+| Recompute | Load from `/dev/shm` | Load from Lustre |
+|---|---|---|
+| 24 s | 1.7 s | 3.3 s |
+
+![Agents](docs/figures/agents.png)
+
+At 48 agents (4 GPUs):
+
+| Design | Session time | Throughput (steps/s) | p99 TTFT |
+|---|---|---|---|
+| Least-loaded, GPU only | 1628 s | 0.52 | 52 s |
+| Prefix affinity, GPU only | 973 s | 0.75 | 53 s |
+| Least-loaded + `/dev/shm` tier (100 GB) | 859 s | 0.90 | 46 s |
+| Prefix affinity + `/dev/shm` tier (100 GB) | 577 s | 1.25 | 41 s |
+| Least-loaded + Lustre tier (100 GB) | 836 s | 0.92 | 48 s |
+| **Least-loaded + Lustre tier (2 TB, nothing evicted)** | **402 s** | **1.55** | **16 s** |
+
+- **Without a tier, affinity flips from worst to best.** In chat it collapsed onto one replica. Here each session's own long prefix decides the match, so affinity just keeps a session where its KV is, and a miss costs a full 100k-token recompute. Least-loaded on GPUs alone recomputes constantly (16% hits).
+- **A small tier helps, but eviction gets in the way.** At 48 agents the sessions' KV no longer fits in 100 GB. `gc.py` deletes the *oldest-written* blocks (tmpfs doesn't record reads), and for agents that is the worst choice: every session's oldest blocks are the head of its prompt, and a prefix match stops at the first missing block, so evicting the head throws away the whole session. The model shows this directly: with oldest-first eviction it reproduces the measured hit rate (65.1% vs 65.6%); with least-recently-used eviction, which is what DeepSeek's GC does, it predicts 79%. Affinity hides the problem by keeping most hits on the GPU.
+- **Capacity beats distance.** Lustre is 2x slower per load, and with the same 100 GB it performs like `/dev/shm`. With 2 TB, nothing is evicted, and plain least-loaded routing becomes the best design by far: 4x faster sessions and 3x the throughput of the GPU-only baseline. With enough storage, DeepSeek's "no prefix-affinity routing" wins for agents too.
+
+So the agent version of the story: the tier stops being an optimization and becomes the thing that decides how many agents a GPU can serve, and what matters most about it is that it's big enough to never evict a live session.
+
+All 22,820 agent requests succeeded. The simulator (below), given the long-context calibration and recorded tool gaps, predicts mean session time within 3% (median) and 23% (worst) across the 25 runs it wasn't fitted on. Its predictions for the other arms were saved while the sweep was still running (`results/agents_predictions.json`), and it predicted about 380 s at 48 agents for the 2 TB tier before those runs (measured: 402 s).
+
 ## Why: a step-by-step model of a replica
 
 `calibrate.py` measures one replica in isolation:
@@ -99,7 +140,7 @@ One extra number, a 1.2x slowdown for what a loaded server adds on top of isolat
 - TTFT typically within 10–20%, but off by up to 1.6x at 7x, right at the knee, where small errors in capacity turn into large errors in queueing;
 - at every load, a shared-tier design is the best one, as measured.
 
-The same procedure on the other two sweeps, each with its own calibration, fits a similar slowdown (1.18 for toolagent, 1.13 for Qwen3-8B) and predicts hit rates within 4 points.
+The same procedure on the other sweeps, each with its own calibration, fits a similar slowdown (1.18 for toolagent, 1.13 for Qwen3-8B, 1.10 for agents) and predicts hit rates within 4 points. Two things the model needed to match reality: tier copies queue on each replica's host link, and the tier evicts oldest-written blocks first, like `gc.py`. One thing it misses: pure affinity on toolagent. Which replica a hot system prompt sticks to depends on where its first request happens to land; the real run put two of the three prompts on one replica, the model spread them across three.
 
 ```
 python3 validate.py results/conv_qwen25 --calib results/calib_qwen25/calib.json \
@@ -113,6 +154,12 @@ bash perlmutter/launch.sh 03:00:00 perlmutter/jobs/conv_qwen25.sh   # one 4-GPU 
 python3 analyze.py results/conv_qwen25                              # one row per run
 python3 figures.py results/conv_qwen25 --speed 5
 python3 docs/make_diagram.py
+
+bash perlmutter/launch.sh 01:30:00 perlmutter/jobs/agents_pilot.sh  # 128k calibration, both tiers
+bash perlmutter/launch.sh 04:00:00 perlmutter/jobs/agents_gpu.sh    # also agents_shared, agents_lustre, agents_lustre_big
+python3 validate.py results/agents_qwen25 --calib results/calib_agents/calib_shared.json \
+    --calib-lustre results/calib_agents/calib_lustre.json --kv-bytes 57344
+python3 figures.py results/agents_qwen25 --agents
 ```
 
 `perlmutter/run.sh` expects a vLLM venv (`$SCRATCH/vllm-dev/env.sh`) and models in `$SCRATCH/huggingface`. Everything for one node runs from a single `srun`, because Slingshot allows only 3 network applications per node.
@@ -120,6 +167,7 @@ python3 docs/make_diagram.py
 | File | What it is |
 |---|---|
 | `trace.py` | Mooncake trace → conversation-sampled workload → token ids with the trace's prefix sharing |
+| `agents.py` | FreeInference agent trace → closed-loop agent sessions with the same prefix structure |
 | `policies.py` | Routing policies and the router's guess of each replica |
 | `router.py` | The routing proxy in front of the replicas |
 | `replay.py` | Sends the trace at its arrival times; records TTFT and each replica's cache hits |
