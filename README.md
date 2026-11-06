@@ -149,7 +149,7 @@ One number is fitted per sweep: a 1.1–1.2x slowdown for what a loaded server a
 
 - chat: hit rates within 4 points; TTFT typically within 10–20%, off by up to 1.6x right at the knee, where small errors in capacity become large errors in queueing;
 - agents: session time within 6% (median) over 46 runs, including the GC runs; hit rates within 2.5 points (median). Most predictions were saved before their runs finished (`results/agents_predictions.json`, `results/gc_*predictions.json`). The misses:
-  - protect: the model is too optimistic on 6 of 7 runs, by 15% (median) and up to 22%, and finds too many tier hits (51% vs 36% on the worst run). Not the cause: the GC's slack (fixed below), checking the tier at arrival vs at scheduling, or vLLM's per-replica CPU tier hiding reads from the GC (a CPU tier of 8 GB holds 2–3 sessions; modeling it changes nothing). Still open.
+  - protect: the model is too optimistic on 6 of 7 runs, by 15% (median) and up to 22%. The real runs lose a session's whole prefix about twice as often (24–32% of steps vs 14% at 50 GB), even right after a short gap, when the session should be protected. The real GC behaves as if its window were half as long: halving the model's window reproduces all four least-loaded protect runs within 12%. Why, I don't know. Not the cause: the GC's slack (fixed below), checking the tier at arrival vs at scheduling, vLLM's per-replica CPU tier hiding reads from the GC, vLLM rewriting files (it skips existing ones), or blocks deleted between lookup and load.
   - prefix affinity at 48 agents: the model finds 5–12 points fewer GPU hits than vLLM did, and is off by up to 26%.
 
 Two misses taught me something about the system:
