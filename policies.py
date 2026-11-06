@@ -11,10 +11,10 @@ Policies:
   prefix_cap  like prefix, but only among replicas whose pending work is within
               `cap` tokens of the least loaded one (SGLang's balance threshold)
 
-Caches, for the simulator:
-  Replica     LRU. Also the router's picture of a replica.
-  ChainCache  LRU among the ends of prefix chains, as vLLM's GPU cache evicts
-  Tier        a host tier, trimmed by tier_gc.py's own code on a simulated clock
+Caches:
+  Replica     the router's picture of one replica (pending work + an LRU of blocks)
+  ChainCache  the simulator's GPU cache: LRU among the ends of prefix chains, as vLLM evicts
+  Tier        the simulator's host tier, trimmed by tier_gc.py's own code on a simulated clock
 """
 import heapq
 from collections import Counter, OrderedDict
@@ -34,6 +34,9 @@ def block_keys(tokens, block=BLOCK):
 
 
 class Replica:
+    """What the router knows about one replica: prefill tokens sent but not yet
+    answered, and an LRU of the blocks it sent there."""
+
     def __init__(self, capacity_blocks):
         self.pending = 0
         self.capacity = capacity_blocks

@@ -1,7 +1,7 @@
 """vLLM's file-system KV tier, plus a record of which blocks get read.
 
-vLLM's tier never deletes anything, so gc.py keeps it under budget. To evict well,
-gc.py needs to know which blocks are still being reused, but tmpfs doesn't update a
+vLLM's tier never deletes anything, so tier_gc.py keeps it under budget. To evict well,
+tier_gc.py needs to know which blocks are still being reused, but tmpfs doesn't update a
 file's access time on read. This subclass stamps it whenever vLLM loads a block:
     atime = last read, mtime = when written.
 Everything else (hashing, file layout, GPU <-> CPU <-> file copies) is vLLM's tier.
@@ -23,5 +23,5 @@ class ReadStampedTier(FileSystemTierManager):
             try:
                 os.utime(path, (now, os.stat(path).st_mtime))
             except FileNotFoundError:
-                pass  # gc.py deleted it since the lookup; vLLM recomputes the block
+                pass  # tier_gc.py deleted it since the lookup; vLLM recomputes the block
         super().submit_load(job_metadata)

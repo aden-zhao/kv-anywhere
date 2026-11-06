@@ -86,11 +86,6 @@ def block_tokens(h, lo=1000, hi=100000):
     return [rng.randrange(lo, hi) for _ in range(BLOCK)]
 
 
-def token_ids(req):
-    """A request's prompt: its blocks' tokens, cut to its length."""
-    return [t for h in req.hash_ids for t in block_tokens(h)][:req.input_len]
-
-
 if __name__ == "__main__":
     import sys
     name = sys.argv[1] if len(sys.argv) > 1 else "toolagent"

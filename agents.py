@@ -7,7 +7,7 @@ Every request lists ids for its 16-token blocks, unique within a week, so sharin
 across sessions (common system prompts) is kept too.
 
 We regroup those ids into chained 512-token ids (id i names the whole prefix up to
-block 32*(i+1)), so trace.token_ids, policies.py and sim.py work unchanged.
+block 32*(i+1)), so trace.py's token blocks, policies.py and sim.py work unchanged.
 
 Replay is closed-loop: an agent sends step k+1 only after step k finishes, plus the
 recorded gap between them (tool time, or a human typing; capped by `gap_cap`).

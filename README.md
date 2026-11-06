@@ -21,14 +21,14 @@ Affinity brings the request to its cache. A shared tier brings the cache to the 
 - **Chat: routing by load plus a shared tier beats every GPU-only policy.** p99 time to first token drops from 16.7 s to 5.0 s at the load where GPU-only least-loaded saturates. Pure prefix affinity sends every request to one replica.
 - **Sharing matters, not capacity.** The same tier split into private per-replica pieces adds nothing.
 - **The payoff scales with how cheap loading is compared with recomputing.** Qwen3-8B stores 2.6x more KV per token than Qwen2.5-7B, and its gain shrinks from 3.3x to 1.3x.
-- **Agents change the calculus.** Contexts are 100k+ tokens and almost all of each prompt repeats the previous one. Without a tier, affinity becomes the best policy. With a small tier, eviction hurts: a prefix is a chain, so evicting a session's oldest blocks loses all of it. With a tier big enough to never evict (2 TB on Lustre), plain least-loaded routing wins: sessions finish 4x faster than GPU-only, with 3x the throughput.
-- **For agents, what the tier deletes matters as much as its size.** Deleting the oldest-written blocks keeps cutting the start off live sessions; with least-recently-used, the tier stops hurting at ~140 GB instead of ~220 GB (model). Protecting live sessions beats LRU by another 13–22% when the tier is short (measured on two samples of 48 agents).
-- **A step-by-step model of vLLM, calibrated on isolated requests, predicts most of this:** agent session times within 6% (median) over 46 runs. It overstates the protect policy, and I haven't found why.
+- **Agents change the calculus.** Contexts are 100k+ tokens, and each prompt repeats almost all of the previous one. Without a tier, affinity becomes the best policy. With a tier big enough never to evict (2 TB on Lustre), plain least-loaded routing wins: sessions finish 4x faster than GPU-only, with 3x the throughput.
+- **When the tier is too small, what it deletes matters.** A prefix is a chain, so deleting a session's oldest blocks loses all of it. With least-recently-used eviction the tier stops hurting at ~140 GB instead of ~220 GB (model), and protecting live sessions beats LRU by another 13–22% (measured on two samples of 48 agents).
+- **A step-by-step model of vLLM, calibrated on isolated requests, predicts most of this:** agent session times within 6% (median) over 46 runs. It overstates the protect policy, for reasons I haven't found.
 
 ## How it works
 
 - **Replicas.** 4 × vLLM (Qwen2.5-7B-Instruct), one per A100-40GB, each with its GPU prefix cache (about 380k tokens).
-- **Shared tier.** vLLM's `OffloadingConnector` with a file-system tier, one directory for all four replicas, either in node-local memory (`/dev/shm`) or on Lustre (`$SCRATCH`, a distributed file system every node can read). A block's file name is a hash of its tokens, so a replica finds blocks another replica wrote. vLLM's tier never deletes anything, so `tier_gc.py` keeps it under its budget (100 GB = 1.7M tokens): once a second, if the tier is over budget, it deletes blocks down to 90% of it, oldest-written first unless a run picks another policy (see [Which blocks to evict](#which-blocks-to-evict)).
+- **Shared tier.** vLLM's `OffloadingConnector` with a file-system tier, one directory for all four replicas, either in node-local memory (`/dev/shm`) or on Lustre (`$SCRATCH`, a distributed file system every node can read). A block's file name is a hash of its tokens, so a replica finds blocks another replica wrote. vLLM's tier never deletes anything, so `tier_gc.py` keeps it under budget (100 GB = 1.7M tokens): once a second, it deletes blocks down to 90% of the budget, oldest-written first unless a run picks [another policy](#which-blocks-to-evict).
 - **Router.** `router.py`, a small proxy. It can't see inside the replicas, so it keeps its own guess of each (prefill tokens sent but not yet answered, and the prompt blocks it sent there) and picks a replica with a policy from `policies.py`: least-loaded, prefix affinity, or *capped affinity* (affinity only among replicas within 16k pending tokens of the least loaded, like SGLang's balance threshold).
 - **Controls.** *Private tiers* (the same capacity, split per replica) separate "more cache" from "shared cache".
 - **Chat workload.** The Mooncake *conversation* trace (Kimi, FAST'25) lists, for each real request, an arrival time and a hash id per 512-token block. `trace.py` turns each id into a fixed block of random tokens, so replayed prompts share exactly what the real ones shared. It keeps 30% of the conversations (each one whole) from a 10-minute window, 481 requests, and compresses time to set the load ("5x" plays the 10 minutes in 2).
@@ -94,42 +94,39 @@ At 48 agents (4 GPUs, Qwen2.5-7B with its 128k-context setting):
 | **Least-loaded + Lustre tier (2 TB, nothing evicted)** | **402 s** | **1.55** | **16 s** |
 
 - **Without a tier, affinity flips from worst to best.** Each session's own long prefix decides the match, so affinity just keeps a session where its KV is. Least-loaded on GPUs alone recomputes constantly (16% of prompt tokens from cache).
-- **A small tier is hurt by eviction.** At 48 agents the sessions' KV doesn't fit in 100 GB. By default `tier_gc.py` deletes the oldest-written blocks (tmpfs doesn't record reads), which for agents is the worst choice: a session's oldest blocks are the start of its prompt, and a prefix match stops at the first missing block, so evicting the start loses the whole session. Smarter eviction gets back much of the gap: see [below](#which-blocks-to-evict).
+- **A small tier is hurt by eviction.** At 48 agents the sessions' KV doesn't fit in 100 GB, and by default `tier_gc.py` deletes the oldest-written blocks. For agents that's the worst choice: a session's oldest blocks are the start of its prompt, and a prefix match stops at the first missing block. Better policies are [below](#which-blocks-to-evict).
 - **Capacity beats distance.** With the same 100 GB, Lustre performs like `/dev/shm`. With 2 TB nothing is evicted, and plain least-loaded routing becomes the best design by far. With enough storage, DeepSeek's "no prefix-affinity routing" wins for agents too.
 
 For agents the tier is no longer an optimization: it decides how many agents a GPU can serve, and what matters most is that it's big enough to never evict a live session. All 22,820 agent requests succeeded.
 
 ### Which blocks to evict
 
-When the tier can't be big enough, what the GC deletes decides which sessions keep their cache. `tier_gc.py` has three policies:
+When the tier can't hold every live session, what the GC deletes decides which sessions keep their cache. `tier_gc.py` has three policies:
 
 - **oldest**: oldest-written first. Needs nothing from vLLM, but a session's prompt start, reused every step, looks as old as a dead session's.
-- **lru**: least recently used, what DeepSeek's GC does. tmpfs doesn't update access times on read, so `kvtier.py` subclasses vLLM's file tier to stamp a block whenever it's loaded.
-- **protect**: never delete a block used within the last ~3 steps of its session (3x the median gap between reads of a block, measured as it runs); when every block is that fresh, delete the newest never-read blocks first. Under pressure some sessions stay whole, instead of every session losing its start. This is Denning's working set, plus bypassing newcomers.
+- **lru**: least recently used, what DeepSeek's GC does. tmpfs doesn't record reads, so `kvtier.py` subclasses vLLM's file tier to stamp each block when it's loaded.
+- **protect**: never delete a block used within about three of its session's steps (3x the median gap between reads); if every block is that fresh, delete the newest never-read blocks first. Under pressure some sessions stay whole, instead of every session losing its start (Denning's working set, plus bypassing newcomers).
 
-Mean session time at 48 agents, `/dev/shm` tier. Sample A is the agent sweep's 48 sessions; sample B is another 48 from the same trace (13% more tokens), run later to check the result:
+Mean session time at 48 agents, `/dev/shm` tier. A and B are two samples of 48 sessions from the trace; B (13% more tokens) was run later to check A. All 21,192 requests succeeded.
 
-| Routing, tier size | sample | oldest | lru | protect | protect vs lru |
-|---|---|---|---|---|---|
-| least-loaded, 50 GB | A | 1422 s | 1377 s | **1188 s** | −14% |
-| | B | | 1884 s | **1639 s** | −13% |
-| least-loaded, 100 GB | A | 867 s | 695 s | **543 s** | −22% |
-| | B | | 1043 s | **842 s** | −19% |
-| prefix affinity, 50 GB | A | 697 s | 797 s | **600 s** | −25% |
-| | B | | 981 s | **947 s** | −3% |
-| prefix affinity, 100 GB | A | 564 s | **506 s** | 547 s | +8% |
+| Routing, tier | oldest (A) | lru (A / B) | protect (A / B) | protect vs lru |
+|---|---|---|---|---|
+| least-loaded, 50 GB | 1422 s | 1377 / 1884 s | **1188 / 1639 s** | −14% / −13% |
+| least-loaded, 100 GB | 867 s | 695 / 1043 s | **543 / 842 s** | −22% / −19% |
+| prefix affinity, 50 GB | 697 s | 797 / 981 s | **600 / 947 s** | −25% / −3% |
+| prefix affinity, 100 GB | 564 s | **506 s** | 547 s | +8% |
 
-- **Protecting live sessions wins when the tier is short of space.** With least-loaded routing it beats LRU by 13–22% on both samples, and oldest-first by 37% at 100 GB. All 21,192 requests in these runs succeeded.
-- **With least-loaded routing every step reads the tier**, so the GC sees which sessions are live. Under affinity most prefixes are found on the GPU and never read from the tier, so the read-based policies have less to go on, and the results swing between runs (−25% on one sample, −3% on the other).
-- **Eviction policy can stand in for capacity.** Least-loaded with protect at 100 GB (543 s) matches prefix affinity with the default GC (564 s), without pinning sessions to replicas.
+- **With least-loaded routing, protect beats LRU by 13–22% on both samples**, and oldest-first by 37% at 100 GB. Every step reads the tier, so the GC can tell which sessions are live.
+- **Under affinity the result swings** (−25% on A, −3% on B). Most prefixes are found on the GPU and never read from the tier, so the read-based policies have less to go on.
+- **Eviction can stand in for affinity.** Least-loaded with protect at 100 GB (543 s) matches prefix affinity with the default GC (564 s).
 
-The model reproduces oldest-first and LRU closely (median error 4%), so it can say what capacity is worth (`capacity.py`; lines are the model, dots the measured runs of sample A):
+The model matches oldest-first and LRU closely (median error 4%), so it can say what capacity is worth (`capacity.py`; lines are the model, dots the measured runs of sample A):
 
 ![GC policies vs tier size](docs/figures/gc.png)
 
-- Around 140 GB the agents' working set fits, and LRU stops evicting anything useful. Oldest-first needs ~220 GB to get there, because it keeps deleting the start of live sessions: smarter eviction is worth ~80 GB of DRAM here.
-- The model overstates protect. Its predictions for sample B, saved before the runs, had protect beating LRU by 28–32%; the runs measured 13–19%. So the green curve is an upper bound: at 100 GB, protect is worth at most ~10 GB over LRU (and ~50 GB over oldest-first).
-- Under affinity the model's curves are jagged: which replica a session sticks to depends on timing, so small changes reshuffle sessions and the result swings by 10–20%.
+- With LRU, the 48 sessions stop losing cache at ~140 GB; oldest-first needs ~220 GB. Smarter eviction is worth ~80 GB of DRAM here.
+- The protect curve is an upper bound. The model overstates protect: it predicted 28–32% over LRU for sample B, and the runs measured 13–19%. At 100 GB, protect is worth at most ~10 GB over LRU.
+- Under affinity the curves are jagged: which replica a session sticks to depends on timing, so small changes swing the result by 10–20%.
 
 ## Why: a step-by-step model of a replica
 
@@ -143,20 +140,25 @@ The model reproduces oldest-first and LRU closely (median error 4%), so it can s
 
 A decode step reads the weights once (15 GB at ~1.5 TB/s ≈ 10 ms) plus every running request's KV (57 KB per token). Prefill is limited by compute and decode by memory bandwidth, and a busy replica does both in every step. The prefill fit, made on prompts up to 15k tokens, predicts the 120k-token recompute within 3% (24.4 s vs 23.9 s).
 
-`sim.py` replays the same workloads through these costs, stepping each replica the way vLLM does: every running request decodes one token per step, the rest of the 2048-token budget goes to prefill chunks, a request starts only once its KV fits, tier copies queue one at a time per replica, and the GPU cache evicts the ends of prompts first (vLLM frees a request's blocks tail-first). The router is the same code as the real one (`policies.py`), and so is the tier's GC: the simulated tier calls `tier_gc.py`'s own deletion code once a simulated second. Like the real tier, it learns a block was used only when the block is loaded from it, not when a replica finds it on its GPU.
+`sim.py` replays the same workloads through these costs, stepping each replica the way vLLM does:
+- every running request decodes one token per step, and the rest of the 2048-token budget goes to prefill chunks;
+- a request starts only once its KV fits, and tier copies queue one at a time per replica;
+- the GPU cache evicts the ends of prompts first (vLLM frees a request's blocks tail-first);
+- the router is the same code as the real one (`policies.py`), and the tier runs `tier_gc.py`'s own deletion code once a simulated second. Like the real tier, it learns that a block was used only when the block is loaded from it, not when a replica finds it on its GPU.
 
 One number is fitted per sweep: a 1.1–1.2x slowdown for what a loaded server adds on top of isolated requests (scheduler and API-server CPU, mixed batches), fitted on the GPU-only least-loaded runs. With it fixed, the model predicts the rest:
 
 - chat: hit rates within 4 points; TTFT typically within 10–20%, off by up to 1.6x right at the knee, where small errors in capacity become large errors in queueing;
-- agents: session time within 6% (median) over 46 runs, including the GC runs; hit rates within 2.5 points (median). Most predictions were saved before their runs finished (`results/agents_predictions.json`, `results/gc_*predictions.json`). The misses:
-  - protect: the model is too optimistic on 6 of 7 runs, by 15% (median) and up to 22%. The real runs lose a session's whole prefix about twice as often (24–32% of steps vs 14% at 50 GB), even right after a short gap, when the session should be protected. The real GC behaves as if its window were half as long: halving the model's window reproduces all four least-loaded protect runs within 12%. Why, I don't know. Not the cause: the GC's slack (fixed below), checking the tier at arrival vs at scheduling, vLLM's per-replica CPU tier hiding reads from the GC, vLLM rewriting files (it skips existing ones), or blocks deleted between lookup and load.
-  - prefix affinity at 48 agents: the model finds 5–12 points fewer GPU hits than vLLM did, and is off by up to 26%.
+- agents: session time within 6% (median) over 46 runs; hit rates within 2.5 points (median). Most predictions were saved before their runs finished (`results/*predictions.json`).
 
-Two misses taught me something about the system:
+What the misses taught me:
 - An earlier model evicted GPU blocks head-first and missed agent hit rates by up to 9 points. vLLM frees a request's blocks tail-first; matching that fixed it.
-- The first GC model predicted that protecting live sessions would beat LRU by 34% at 50 GB; it won by 14%. The model kept the tier exactly at its budget, but `tier_gc.py` trims to 90% whenever it runs, so the real tier averages ~93% full. That slack, not the deletion order, was most of the error: near the knee a few percent of capacity is worth 5 hit points and 20% of session time. Running `tier_gc.py`'s own code inside the model fixed most of it (median error on the first 12 GC runs 16% → 10%).
+- The first GC model predicted protect would beat LRU by 34% at 50 GB; it won by 14%. The model kept the tier exactly at its budget, but `tier_gc.py` trims to 90% whenever it runs, so the real tier averages ~93% full. Near the knee, a few percent of capacity is worth 5 hit points and 20% of session time. Running `tier_gc.py`'s own code inside the model fixed most of it (median error 16% → 10% on the first 12 GC runs).
 
-What it misses: on the toolagent trace, which replica a hot system prompt sticks to depends on where its first request happens to land. The real run put two of the three prompts on one replica; the model spread them across three.
+Where it's still wrong:
+- **protect**: too optimistic on 6 of 7 runs (median 15%, up to 22%). The real runs lose a session's whole prefix about twice as often (24–32% of steps vs 14% at 50 GB), even right after a short gap, when the session should be protected. The real GC acts as if its window were half as long: halving the model's window reproduces all four least-loaded protect runs within 12%. I don't know why. Ruled out: when the tier is checked (arrival vs scheduling), vLLM's per-replica CPU tier hiding reads from the GC, vLLM rewriting files, and blocks deleted between lookup and load.
+- **prefix affinity at 48 agents**: the model finds 5–12 points fewer GPU hits than vLLM, and is off by up to 26%.
+- **toolagent**: which replica a hot system prompt sticks to depends on where its first request lands. The real run put two of the three prompts on one replica; the model spread them across three.
 
 ```
 python3 validate.py results/agents_qwen25 --calib results/calib_agents/calib_shared.json \
@@ -186,7 +188,7 @@ python3 docs/make_diagram.py
 |---|---|
 | `trace.py` | Mooncake trace → conversation-sampled workload → token ids with the trace's prefix sharing |
 | `agents.py` | FreeInference agent trace → closed-loop agent sessions with the same prefix structure |
-| `policies.py` | Routing policies and the router's guess of each replica |
+| `policies.py` | Routing policies, the router's guess of each replica, and the simulator's caches |
 | `router.py` | The routing proxy in front of the replicas |
 | `replay.py` | Sends a workload to the router; records TTFT and each replica's cache hits |
 | `sweep.py` | Starts 4 replicas per server config and runs every policy × load |
