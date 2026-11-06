@@ -1,0 +1,80 @@
+{
+ "router": {
+  "policy": "least",
+  "cap": 16384,
+  "sent": [
+   323,
+   309,
+   273,
+   299
+  ],
+  "pending": [
+   0,
+   0,
+   0,
+   0
+  ],
+  "cached_blocks": [
+   745,
+   745,
+   745,
+   745
+  ]
+ },
+ "backends": [
+  "http://localhost:8100",
+  "http://localhost:8101",
+  "http://localhost:8102",
+  "http://localhost:8103"
+ ],
+ "model": "Qwen/Qwen2.5-7B-Instruct",
+ "trace": "agents",
+ "seed": 1,
+ "out": "results/agents_gc_seed1/agents_n48_shared_least_protect_100gb_seed1.csv",
+ "mode": "shared",
+ "policy": "least",
+ "tier_gb": 100.0,
+ "gc": "protect",
+ "start": 600,
+ "dur": 600.0,
+ "frac": 0.3,
+ "speed": 1.0,
+ "agents": 48,
+ "max_steps": 30,
+ "gap_cap": 30.0,
+ "wall": 1169.0970245329663,
+ "counters": [
+  {
+   "vllm:prefix_cache_queries_total": 17795424.0,
+   "vllm:prefix_cache_hits_total": 4662064.0,
+   "vllm:external_prefix_cache_queries_total": 13133360.0,
+   "vllm:external_prefix_cache_hits_total": 9101104.0,
+   "vllm:prompt_tokens_total": 17795424.0,
+   "vllm:generation_tokens_total": 67514.0
+  },
+  {
+   "vllm:prefix_cache_queries_total": 17033488.0,
+   "vllm:prefix_cache_hits_total": 2930656.0,
+   "vllm:external_prefix_cache_queries_total": 14102832.0,
+   "vllm:external_prefix_cache_hits_total": 9962256.0,
+   "vllm:prompt_tokens_total": 17033488.0,
+   "vllm:generation_tokens_total": 62252.0
+  },
+  {
+   "vllm:prefix_cache_queries_total": 13538096.0,
+   "vllm:prefix_cache_hits_total": 2704416.0,
+   "vllm:external_prefix_cache_queries_total": 10833680.0,
+   "vllm:external_prefix_cache_hits_total": 6759232.0,
+   "vllm:prompt_tokens_total": 13538096.0,
+   "vllm:generation_tokens_total": 55874.0
+  },
+  {
+   "vllm:prefix_cache_queries_total": 15503616.0,
+   "vllm:prefix_cache_hits_total": 2462800.0,
+   "vllm:external_prefix_cache_queries_total": 13040816.0,
+   "vllm:external_prefix_cache_hits_total": 9225392.0,
+   "vllm:prompt_tokens_total": 15503616.0,
+   "vllm:generation_tokens_total": 62961.0
+  }
+ ]
+}

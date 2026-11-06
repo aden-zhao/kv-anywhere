@@ -62,12 +62,11 @@ class Window:
             self.seconds = 3 * sorted(self.gaps)[len(self.gaps) // 2]
 
 
-def deletion_order(blocks, policy, window):
+def deletion_order(blocks, policy, window, now):
     if policy == "oldest":
         return sorted(blocks, key=lambda b: b.written)
     if policy == "lru":
         return sorted(blocks, key=lambda b: b.last_used)
-    now = time.time()
     stale = sorted((b for b in blocks if now - b.last_used > window.seconds), key=lambda b: b.last_used)
     fresh = [b for b in blocks if now - b.last_used <= window.seconds]
     newcomers = sorted((b for b in fresh if not b.read), key=lambda b: -b.written)  # newest first
@@ -75,18 +74,26 @@ def deletion_order(blocks, policy, window):
     return stale + newcomers + in_use
 
 
-def collect(root, budget, policy, window):
-    blocks = scan(root)
+def to_delete(blocks, budget, policy, window, now):
+    """Nothing while under budget; once over, enough blocks to get down to 90% of it
+    (the slack keeps it from deleting a few blocks every second). sim.py runs this too."""
     window.update(blocks)
     total = sum(b.size for b in blocks)
     if total <= budget:
-        return
-    for b in deletion_order(blocks, policy, window):
+        return []
+    out = []
+    for b in deletion_order(blocks, policy, window, now):
         if total <= 0.9 * budget:
             break
+        out.append(b)
+        total -= b.size
+    return out
+
+
+def collect(root, budget, policy, window):
+    for b in to_delete(scan(root), budget, policy, window, time.time()):
         try:
             os.remove(b.path)
-            total -= b.size
         except FileNotFoundError:
             pass
 

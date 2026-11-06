@@ -3,13 +3,17 @@
 
     python3 figures.py results/conv_qwen25 --out docs/figures [--load 5]
     python3 figures.py results/agents_qwen25 --agents
+    python3 figures.py results/agents_gc_least results/agents_gc_prefix --gc
 
 ttft.png    median and p99 TTFT vs load for the four main arms
 agents.png  (--agents) mean session time and throughput vs concurrent agents
+gc.png      (--gc) session time vs tier size for each tier GC policy: the model's curves
+            (capacity.py) and the measured runs
 tokens.png  where each arm's prompt tokens came from at one load:
             GPU prefix cache, the KV tier, or recomputed
 """
 import argparse
+import json
 import os
 
 import matplotlib
@@ -126,14 +130,55 @@ def agents_figure(rows, out):
     fig.savefig(out, dpi=160, facecolor=SURFACE)
 
 
+GC_POLICIES = [("oldest", "oldest written", "#2a78d6"),
+               ("lru", "least recently used", "#eb6834"),
+               ("protect", "protect live sessions", "#1baf7a")]
+
+
+def gc_figure(dirs, capacity, out):
+    """Model curves of session time vs tier size (capacity.py), with the measured runs."""
+    model = json.load(open(capacity))
+    runs = analyze.load(dirs)
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4), facecolor=SURFACE, sharey=True)
+    for ax, policy, title in [(axes[0], "least", "Least-loaded routing"),
+                              (axes[1], "prefix", "Prefix-affinity routing")]:
+        style(ax)
+        for gc, label, color in GC_POLICIES:
+            pts = [(r["tier_gb"], r["session_mean"]) for r in model["rows"]
+                   if r["policy"] == policy and r["gc"] == gc]
+            ax.plot(*zip(*pts), color=color, linewidth=2, label=label)
+            meas = [(r["tier_gb"], r["session_mean"]) for r in runs
+                    if r["policy"] == policy and r["gc"] == gc]
+            ax.plot(*zip(*meas), "o", color=color, markersize=8, markeredgecolor=SURFACE,
+                    markeredgewidth=2)
+        floor = min(r["session_mean"] for r in model["rows"] if r["policy"] == policy)
+        ax.axhline(floor, color=INK2, linewidth=1, linestyle=(0, (4, 3)))
+        ax.text(250, floor + 25, "nothing evicted", ha="right", fontsize=8, color=INK2)
+        ax.set_xlabel("shared tier size (GB)", color=INK2, fontsize=9)
+        ax.set_title(title, color=INK, fontsize=11, loc="left")
+        ax.set_ylim(bottom=0)
+    axes[0].set_ylabel(f"mean session time (s), {model['agents']} agents", color=INK2, fontsize=9)
+    axes[0].plot([], [], "o", color=INK2, markersize=8, label="measured")
+    axes[0].plot([], [], color=INK2, linewidth=2, label="model")
+    axes[0].legend(frameon=False, fontsize=8, labelcolor=INK2, loc="upper right")
+    fig.tight_layout()
+    fig.savefig(out, dpi=160, facecolor=SURFACE)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dirs", nargs="+")
     ap.add_argument("--out", default="docs/figures")
     ap.add_argument("--load", type=float, default=None, help="trace speedup for tokens.png")
     ap.add_argument("--agents", action="store_true", help="agent sweep: draw agents.png only")
+    ap.add_argument("--gc", action="store_true", help="GC sweeps: draw gc.png only")
+    ap.add_argument("--capacity", default="results/gc_capacity.json", help="capacity.py output")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
+    if a.gc:
+        gc_figure(a.dirs, a.capacity, f"{a.out}/gc.png")
+        print("wrote", a.out)
+        return
     rows = analyze.load(a.dirs)
     if a.agents:
         agents_figure(rows, f"{a.out}/agents.png")

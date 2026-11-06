@@ -192,9 +192,12 @@ def replay(a, mode, policy, load, kv, backends, gc_policy, tier_gb):
         name, knob = f"{a.trace}_f{a.frac}_{mode}_{policy}_s{load:g}", ["--speed", str(load)]
     if len(a.gc_policies) > 1 or len(a.tier_gbs or []) > 1:
         name += f"_{gc_policy}_{tier_gb:g}gb"
+    if a.seed:
+        name += f"_seed{a.seed}"
     subprocess.run([sys.executable, f"{HERE}/replay.py", "--backends", *backends, "--model", a.model,
                     "--trace", a.trace, "--frac", str(a.frac), "--dur", str(a.dur), *knob,
                     "--mode", mode, "--policy", policy, "--tier-gb", str(tier_gb), "--gc", gc_policy,
+                    "--seed", str(a.seed),
                     "--out", f"{a.out}/{name}.csv"])
 
 
@@ -221,6 +224,7 @@ def main():
     ap.add_argument("--calibrate", action="store_true", help="only run calibrate.py (shared config)")
     ap.add_argument("--calib-args", default="", help="extra arguments for calibrate.py")
     ap.add_argument("--calib-mode", default="shared", help="tier to calibrate loads from")
+    ap.add_argument("--seed", type=int, default=0, help="which sessions/requests to sample")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     logdir = os.path.join(a.out, "logs")

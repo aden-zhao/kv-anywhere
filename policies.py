@@ -11,14 +11,15 @@ Policies:
   prefix_cap  like prefix, but only among replicas whose pending work is within
               `cap` tokens of the least loaded one (SGLang's balance threshold)
 
-Caches (used by the simulator for GPUs and tiers), by eviction policy:
-  lru      Replica: least recently used
-  oldest   Replica(fifo=True): oldest written, like tier_gc.py --policy oldest
-  chain    ChainCache: least recently used among the ends of prefix chains
-  protect  ProtectCache: like tier_gc.py --policy protect
+Caches, for the simulator:
+  Replica     LRU. Also the router's picture of a replica.
+  ChainCache  LRU among the ends of prefix chains, as vLLM's GPU cache evicts
+  Tier        a host tier, trimmed by tier_gc.py's own code on a simulated clock
 """
 import heapq
 from collections import Counter, OrderedDict
+
+import tier_gc
 
 BLOCK = 512
 
@@ -33,10 +34,9 @@ def block_keys(tokens, block=BLOCK):
 
 
 class Replica:
-    def __init__(self, capacity_blocks, fifo=False):
+    def __init__(self, capacity_blocks):
         self.pending = 0
         self.capacity = capacity_blocks
-        self.fifo = fifo  # evict oldest-written instead of least-recently-used
         self.cache = OrderedDict()
 
     def match(self, keys):
@@ -45,10 +45,8 @@ class Replica:
             n += 1
         return n
 
-    def insert(self, keys, now=0.0):
+    def insert(self, keys):
         for k in keys:
-            if k in self.cache and self.fifo:
-                continue
             self.cache[k] = True
             self.cache.move_to_end(k)
         while len(self.cache) > self.capacity:
@@ -75,7 +73,7 @@ class ChainCache:
             n += 1
         return n
 
-    def insert(self, keys, now=0.0):
+    def insert(self, keys):
         for i, k in enumerate(keys):
             if k not in self.parent:
                 self.parent[k] = keys[i - 1] if i else None
@@ -101,57 +99,44 @@ class ChainCache:
                 heapq.heappush(self.ends, (self.last_used[p], p))
 
 
-class ProtectCache(ChainCache):
-    """Never evict a block used within the last `window` seconds; if only such blocks
-    are left, don't store the rest of the new prompt (it bypasses the cache). The
-    window is 3x the median time between a session's uses: about three of its steps.
-    Under pressure, some sessions stay whole instead of every session partly evicted."""
+class Tier:
+    """A host tier kept under budget the way tier_gc.py keeps it: every `interval`
+    seconds, tier_gc.to_delete picks blocks to delete. A block is stored when it is
+    computed and stamped when it is loaded; a block a request finds on its GPU isn't
+    loaded, so it isn't stamped either (kvtier.py only sees loads)."""
 
-    def __init__(self, capacity_blocks):
-        super().__init__(capacity_blocks)
-        self.used_at, self.gaps, self.window = {}, [], 60.0
+    def __init__(self, capacity_blocks, gc="oldest", interval=1.0):
+        self.capacity, self.gc, self.interval = capacity_blocks, gc, interval
+        self.blocks = {}  # key -> tier_gc.Block
+        self.window = tier_gc.Window()
+        self.next_gc = interval
 
-    def insert(self, keys, now=0.0):
-        n = self.match(keys)  # how long since this session last used its prefix?
-        if n and keys[n - 1] in self.used_at:
-            self.gaps = (self.gaps + [now - self.used_at[keys[n - 1]]])[-500:]
-            if len(self.gaps) >= 20:
-                self.window = 3 * sorted(self.gaps)[len(self.gaps) // 2]
-        stored = 0
-        for i, k in enumerate(keys):
-            if k not in self.parent:
-                if len(self.parent) >= self.capacity and not self.make_room(now):
-                    break  # full of blocks in use: the rest of this prompt isn't stored
-                self.parent[k] = keys[i - 1] if i else None
-                if i:
-                    self.children[keys[i - 1]] += 1
-            self.clock += 1
-            self.last_used[k] = self.clock
-            self.used_at[k] = now
-            stored = i + 1
-        if stored:
-            heapq.heappush(self.ends, (self.last_used[keys[stored - 1]], keys[stored - 1]))
+    def collect(self, now):
+        """Run the GC passes that would have happened by `now`."""
+        while self.next_gc <= now:
+            for b in tier_gc.to_delete(list(self.blocks.values()), self.capacity, self.gc,
+                                       self.window, self.next_gc):
+                del self.blocks[b.path]
+            self.next_gc += self.interval
 
-    def make_room(self, now):
-        while self.ends:
-            t, k = self.ends[0]
-            if not (k in self.parent and self.children[k] == 0 and self.last_used[k] == t):
-                heapq.heappop(self.ends)  # stale entry
-                continue
-            if now - self.used_at[k] < self.window:
-                return False
-            self.evict_one()
-            del self.used_at[k]
-            return True
-        return False
+    def match(self, keys, start):
+        """How far the tier continues a prefix whose first `start` blocks are on the GPU.
+        (vLLM looks up the tier from there on; keys are chained, so a block is valid
+        whether or not the tier still has the ones before it.)"""
+        n = start
+        while n < len(keys) and keys[n] in self.blocks:
+            n += 1
+        return n
 
-
-def make_cache(capacity_blocks, eviction="lru"):
-    if eviction == "chain":
-        return ChainCache(capacity_blocks)
-    if eviction == "protect":
-        return ProtectCache(capacity_blocks)
-    return Replica(capacity_blocks, fifo=eviction == "oldest")
+    def access(self, keys, gpu_hit, tier_hit, now):
+        """A request found keys[:gpu_hit] on its GPU and keys[gpu_hit:tier_hit] here
+        (counted in blocks), and computes the rest, which is then stored."""
+        for k in keys[gpu_hit:tier_hit]:
+            b = self.blocks[k]
+            b.last_used, b.read = now, True
+        for k in keys[tier_hit:]:
+            if k not in self.blocks:
+                self.blocks[k] = tier_gc.Block(k, 1, written=now, last_used=now, read=False)
 
 
 def choose(policy, replicas, keys, cap=16384):

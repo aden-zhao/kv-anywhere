@@ -1,0 +1,61 @@
+{
+ "made": "2026-11-06 02:02",
+ "job": "60891047",
+ "note": "sim with tier_gc's own deletion code (Tier), overhead 1.1; recorded before the seed-1 runs finished",
+ "rows": [
+  {
+   "policy": "least",
+   "tier_gb": 50,
+   "gc": "lru",
+   "hits": 0.24434193722610256,
+   "session_mean": 1778.5940499938172,
+   "session_p90": 2214.001550994982,
+   "steps_per_s": 0.5288567784442311
+  },
+  {
+   "policy": "least",
+   "tier_gb": 50,
+   "gc": "protect",
+   "hits": 0.514936945034387,
+   "session_mean": 1274.4595614714428,
+   "session_p90": 1627.6990913908016,
+   "steps_per_s": 0.6885507740807488
+  },
+  {
+   "policy": "least",
+   "tier_gb": 100,
+   "gc": "lru",
+   "hits": 0.630578714872114,
+   "session_mean": 1026.9421550224058,
+   "session_p90": 1290.2494444856738,
+   "steps_per_s": 0.8294553518077424
+  },
+  {
+   "policy": "least",
+   "tier_gb": 100,
+   "gc": "protect",
+   "hits": 0.8027748092769533,
+   "session_mean": 697.8451572344762,
+   "session_p90": 891.6473054181554,
+   "steps_per_s": 1.1769276695622388
+  },
+  {
+   "policy": "prefix",
+   "tier_gb": 50,
+   "gc": "lru",
+   "hits": 0.8015563461537498,
+   "session_mean": 727.8639237346033,
+   "session_p90": 1040.2470269566331,
+   "steps_per_s": 1.0528712418139572
+  },
+  {
+   "policy": "prefix",
+   "tier_gb": 50,
+   "gc": "protect",
+   "hits": 0.7453467183912279,
+   "session_mean": 829.2579319507408,
+   "session_p90": 1040.6690350540307,
+   "steps_per_s": 1.0505215631939635
+  }
+ ]
+}

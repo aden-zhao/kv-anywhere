@@ -3,15 +3,14 @@
 
     python3 sim.py --calib results/calib_qwen25/calib.json [--frac 0.3] [--speed 3 5 7]
 
-Caches. Each replica has an LRU prompt cache on the GPU. A request's prompt splits
-into three parts:
+Caches. Each replica has a prompt cache on the GPU that evicts like vLLM's (LRU,
+tail of a prompt first). A request's prompt splits into three parts:
     gpu hit   blocks already on the chosen replica's GPU   (free)
-    tier hit  blocks found in the host tier                (copied in)
-    miss      everything else                              (recomputed)
+    tier hit  blocks after those, found in the host tier   (copied in)
+    miss      everything else                              (recomputed, then stored)
 Server configs: gpu (no tier), private (one tier per replica, tier_tokens / n each),
-shared (one tier every replica reads). tier_eviction picks how a full tier makes room:
-"lru", "oldest" (oldest written), "chain" (ends of prefix chains first), or "protect"
-(keep blocks used within about three steps; see policies.py and tier_gc.py).
+shared (one tier every replica reads). The tier runs tier_gc.py's own deletion code
+every gc_interval seconds, with policy gc ("oldest", "lru" or "protect").
 
 Timing. Each replica runs vLLM's loop, one engine step at a time:
   - every running request decodes one token;
@@ -125,14 +124,14 @@ class Cluster:
     """n replicas, their caches, and the router's view of them (as in router.py)."""
 
     def __init__(self, policy, server="gpu", n=4, gpu_tokens=380_000, tier_tokens=1_700_000,
-                 cap=16384, cost=COST, tier_eviction="lru", gpu_eviction="lru"):
+                 cap=16384, cost=COST, gc="oldest", gc_interval=1.0):
         self.policy, self.cap, self.cost = policy, cap, cost
         self.engines = [Engine(i, gpu_tokens, cost) for i in range(n)]
-        self.gpu = [policies.make_cache(gpu_tokens // BLOCK, gpu_eviction) for _ in range(n)]
+        self.gpu = [policies.ChainCache(gpu_tokens // BLOCK) for _ in range(n)]
         if server == "shared":
-            self.tier = [policies.make_cache(tier_tokens // BLOCK, tier_eviction)] * n  # one tier, n references
+            self.tier = [policies.Tier(tier_tokens // BLOCK, gc, gc_interval)] * n  # one tier, n references
         elif server == "private":
-            self.tier = [policies.make_cache(tier_tokens // n // BLOCK, tier_eviction) for _ in range(n)]
+            self.tier = [policies.Tier(tier_tokens // n // BLOCK, gc, gc_interval) for _ in range(n)]
         else:
             self.tier = None
         # The router's guess of each replica: what it sent there, sized to the GPU
@@ -149,12 +148,18 @@ class Cluster:
         i = policies.choose(self.policy, self.view, keys, self.cap)
         n = req.input_len
         est_miss = n - min(self.view[i].match(keys) * BLOCK, n)
-        gpu_hit = min(self.gpu[i].match(keys) * BLOCK, n)
-        tier_hit = max(0, min(self.tier[i].match(keys) * BLOCK, n) - gpu_hit) if self.tier else 0
+        g = t = self.gpu[i].match(keys)  # blocks on the GPU, and where the tier's run ends
+        if self.tier:
+            self.tier[i].collect(now)
+            t = self.tier[i].match(keys, g)
+        gpu_hit = min(g * BLOCK, n)
+        tier_hit = min(t * BLOCK, n) - gpu_hit
         miss = max(1, n - gpu_hit - tier_hit)  # vLLM always recomputes at least one token
         self.view[i].pending += est_miss
-        for cache in [self.view[i], self.gpu[i]] + ([self.tier[i]] if self.tier else []):
-            cache.insert(keys, now)
+        self.view[i].insert(keys)
+        self.gpu[i].insert(keys)
+        if self.tier:
+            self.tier[i].access(keys, g, t, now)
         self.tokens["gpu"] += gpu_hit
         self.tokens["tier"] += tier_hit
         self.tokens["miss"] += n - gpu_hit - tier_hit
