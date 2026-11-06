@@ -69,5 +69,7 @@
    "vllm:prompt_tokens_total": 1198403.0,
    "vllm:generation_tokens_total": 37523.0
   }
- ]
+ ],
+ "mode": "shared",
+ "policy": "prefix_cap"
 }

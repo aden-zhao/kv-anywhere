@@ -11,7 +11,6 @@ import csv
 import glob
 import json
 import os
-import re
 
 
 def pct(xs, q):
@@ -28,20 +27,18 @@ def summarize(path):
     local = sum(x["vllm:prefix_cache_hits_total"] for x in c)
     ext = sum(x["vllm:external_prefix_cache_hits_total"] for x in c)
     prompt = [x["vllm:prompt_tokens_total"] for x in c]
-    if meta.get("mode"):  # newer runs record their labels
-        mode, policy = meta["mode"], meta["policy"]
-    else:
-        mode, policy = re.search(r"_f[\d.]+_(gpu|private|shared)_(\w+?)_s[\d.]+\.csv$", path).groups()
-    load = meta["agents"] if meta.get("trace") == "agents" else meta["speed"]
+    agentic = meta["trace"] == "agents"
     return dict(
-        run=os.path.basename(path)[:-4], mode=mode, policy=policy, speed=load, tier_gb=meta.get("tier_gb"),
+        run=os.path.basename(path)[:-4], mode=meta["mode"], policy=meta["policy"],
+        load=meta["agents"] if agentic else meta["speed"],  # agents, or trace speedup
+        tier_gb=meta.get("tier_gb"), gc=meta.get("gc", "oldest"),
         n=len(rows), failed=len(rows) - len(ttft),
         p50=pct(ttft, 0.5), p90=pct(ttft, 0.9), p99=pct(ttft, 0.99),
         mean=sum(ttft) / max(1, len(ttft)),
         gpu_hit=local / queries if queries else 0, tier_hit=ext / queries if queries else 0,
         imbalance=max(prompt) / (sum(prompt) / len(prompt)) if sum(prompt) else 0,
         sent="/".join(str(s) for s in meta["router"]["sent"]),
-        **(agent_times(rows) if meta.get("trace") == "agents" else {}))
+        **(agent_times(rows) if agentic else {}))
 
 
 def agent_times(rows):
@@ -68,11 +65,11 @@ def main():
     ap.add_argument("--csv")
     a = ap.parse_args()
     out = load(a.dirs)
-    out.sort(key=lambda r: (r["speed"], r["mode"], r["policy"]))
-    print(f"{'speed':>5} {'mode':8s}{'policy':11s}{'n':>5}{'fail':>5}{'p50':>7}{'p90':>7}{'p99':>7}"
+    out.sort(key=lambda r: (r["load"], r["mode"], r["policy"]))
+    print(f"{'load':>5} {'mode':8s}{'policy':11s}{'n':>5}{'fail':>5}{'p50':>7}{'p90':>7}{'p99':>7}"
           f"{'gpu hit':>8}{'tier hit':>9}{'imbal':>6}  sent")
     for r in out:
-        print(f"{r['speed']:5g} {r['mode']:8s}{r['policy']:11s}{r['n']:5d}{r['failed']:5d}"
+        print(f"{r['load']:5g} {r['mode']:8s}{r['policy']:11s}{r['n']:5d}{r['failed']:5d}"
               f"{r['p50']:7.2f}{r['p90']:7.2f}{r['p99']:7.2f}{r['gpu_hit']:8.1%}{r['tier_hit']:9.1%}"
               f"{r['imbalance']:6.2f}  {r['sent']}")
     if a.csv:

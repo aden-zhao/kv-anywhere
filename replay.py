@@ -148,6 +148,7 @@ def main():
     ap.add_argument("--mode", default="", help="server config label, saved with the results")
     ap.add_argument("--policy", default="", help="routing policy label, saved with the results")
     ap.add_argument("--tier-gb", type=float, default=None, help="tier budget label, saved with the results")
+    ap.add_argument("--gc", default="oldest", help="tier_gc.py policy label, saved with the results")
     g = ap.add_argument_group("Mooncake traces (open loop)")
     g.add_argument("--start", type=float, default=600)
     g.add_argument("--dur", type=float, default=600)

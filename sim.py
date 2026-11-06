@@ -6,29 +6,28 @@
 Caches. Each replica has an LRU prompt cache on the GPU. A request's prompt splits
 into three parts:
     gpu hit   blocks already on the chosen replica's GPU   (free)
-    tier hit  blocks found in the host tier                (loaded, see below)
+    tier hit  blocks found in the host tier                (copied in)
     miss      everything else                              (recomputed)
-Server configs:
-    gpu      no host tier
-    private  each replica has its own host tier (tier-tokens / n each)
-    shared   one host tier that every replica reads (tier-tokens total)
+Server configs: gpu (no tier), private (one tier per replica, tier_tokens / n each),
+shared (one tier every replica reads). tier_eviction picks how a full tier makes room:
+"lru", "oldest" (oldest written), "chain" (ends of prefix chains first), or "protect"
+(keep blocks used within about three steps; see policies.py and tier_gc.py).
 
 Timing. Each replica runs vLLM's loop, one engine step at a time:
   - every running request decodes one token;
   - the rest of the step's token budget goes to prefill chunks, oldest first;
-  - a request starts prefill only if its whole context fits in the GPU KV cache;
-  - a tier hit is copied in (DMA, overlapped with compute) before prefill starts.
-    Copies queue: one at a time per replica (its host link), and, if the tier has a
-    total bandwidth limit (tier_gbps, e.g. a network file system), through that too.
-  step time = step_base + step_per_seq * B + step_per_ctx * (KV tokens read by decodes)
+  - a request starts prefill only once its whole context fits in the GPU KV cache;
+  - a tier hit is copied in first (DMA, overlapped with compute), one copy at a
+    time per replica.
+  step time = step_base + step_per_seq * B + step_per_ctx * (context tokens of the B decodes)
             + prefill_per_tok * P + prefill_attn * sum(chunk * (ctx + chunk / 2))
-for B decodes and P prefill tokens. calibrate.py measures all the coefficients from
-isolated requests; `overhead` scales every step for what a loaded server adds on top
-(scheduler and API-server CPU time, mixed-batch inefficiency). It is the one
-parameter fitted to a sweep (validate.py does this, on a single arm).
+for B decoding requests and P prefill tokens. calibrate.py measures the coefficients
+on isolated requests. `overhead` scales every step for what a loaded server adds on
+top (scheduler and API-server CPU, mixed batches); validate.py fits it on one arm.
 """
 import argparse
 import heapq
+import itertools
 import json
 from collections import deque
 
@@ -44,16 +43,12 @@ COST = dict(prefill_base=0.009, prefill_per_tok=5.9e-5, prefill_attn=2.4e-9,
             step_base=0.012, step_per_seq=2e-4, step_per_ctx=5e-9, overhead=1.0)
 
 
-def t_load(tokens, c=COST):
-    return c["load_base"] + c["load_per_tok"] * tokens if tokens > 0 else 0.0
-
-
 class Job:
     """One request inside a replica: waiting, then prefilling, then decoding."""
 
-    def __init__(self, req, ready_at, miss, cached, arrival, est_miss):
+    def __init__(self, req, arrival, ready_at, miss, cached, est_miss):
         self.req, self.arrival, self.est_miss = req, arrival, est_miss
-        self.ready_at = ready_at        # after any tier load
+        self.ready_at = ready_at        # after any tier copy
         self.prefill_left = miss        # tokens still to compute
         self.ctx = cached               # tokens of context already in GPU memory
         self.decode_left = req.output_len - 1
@@ -63,8 +58,8 @@ class Job:
 class Engine:
     """One replica running vLLM's loop: a FIFO of waiting jobs, then prefill, then decode."""
 
-    def __init__(self, kv_tokens, cost):
-        self.kv, self.c = kv_tokens, cost
+    def __init__(self, i, kv_tokens, cost):
+        self.i, self.kv, self.c = i, kv_tokens, cost
         self.clock = 0.0
         self.waiting = deque()
         self.prefilling = []
@@ -88,13 +83,13 @@ class Engine:
         c = self.c
         self.admit()
         if not (self.prefilling or self.decoding):
-            self.clock = max(self.clock, self.waiting[0].ready_at)  # nothing to run until a load lands
+            self.clock = max(self.clock, self.waiting[0].ready_at)  # nothing to run until a copy lands
             return
-        # every decoding job emits one token; leftover budget goes to prefill chunks
+        # every decoding job emits one token; the leftover budget goes to prefill chunks
         B = len(self.decoding)
         t = c["step_base"] + c["step_per_seq"] * B + c["step_per_ctx"] * sum(j.ctx for j in self.decoding)
         budget = BUDGET - B
-        done_prefill = []
+        prefilled = []
         for j in self.prefilling:
             if budget <= 0:
                 break
@@ -104,8 +99,8 @@ class Engine:
             j.ctx += chunk
             budget -= chunk
             if j.prefill_left == 0:
-                done_prefill.append(j)
-        t *= c.get("overhead", 1.0)
+                prefilled.append(j)
+        t *= c["overhead"]
         self.clock += t
         self.busy += t
 
@@ -116,7 +111,7 @@ class Engine:
             self.decoding.remove(j)
             self.used -= j.kv
             on_done(self, j)
-        for j in done_prefill:
+        for j in prefilled:
             self.prefilling.remove(j)
             on_first_token(self, j)
             if j.decode_left > 0:
@@ -126,6 +121,94 @@ class Engine:
                 on_done(self, j)
 
 
+class Cluster:
+    """n replicas, their caches, and the router's view of them (as in router.py)."""
+
+    def __init__(self, policy, server="gpu", n=4, gpu_tokens=380_000, tier_tokens=1_700_000,
+                 cap=16384, cost=COST, tier_eviction="lru", gpu_eviction="lru"):
+        self.policy, self.cap, self.cost = policy, cap, cost
+        self.engines = [Engine(i, gpu_tokens, cost) for i in range(n)]
+        self.gpu = [policies.make_cache(gpu_tokens // BLOCK, gpu_eviction) for _ in range(n)]
+        if server == "shared":
+            self.tier = [policies.make_cache(tier_tokens // BLOCK, tier_eviction)] * n  # one tier, n references
+        elif server == "private":
+            self.tier = [policies.make_cache(tier_tokens // n // BLOCK, tier_eviction) for _ in range(n)]
+        else:
+            self.tier = None
+        # The router's guess of each replica: what it sent there, sized to the GPU
+        # cache plus any tier only that replica can read.
+        view_tokens = gpu_tokens + (tier_tokens // n if server == "private" else 0)
+        self.view = [policies.Replica(view_tokens // BLOCK) for _ in range(n)]
+        self.link_free = [0.0] * n  # when each replica's host link finishes its current copy
+        self.tokens = dict(gpu=0, tier=0, miss=0)
+        self.ttft = []
+
+    def route(self, now, req):
+        """Pick a replica for req and queue it there."""
+        keys = req.hash_ids  # stand-in for policies.block_keys: same chaining, cheaper
+        i = policies.choose(self.policy, self.view, keys, self.cap)
+        n = req.input_len
+        est_miss = n - min(self.view[i].match(keys) * BLOCK, n)
+        gpu_hit = min(self.gpu[i].match(keys) * BLOCK, n)
+        tier_hit = max(0, min(self.tier[i].match(keys) * BLOCK, n) - gpu_hit) if self.tier else 0
+        miss = max(1, n - gpu_hit - tier_hit)  # vLLM always recomputes at least one token
+        self.view[i].pending += est_miss
+        for cache in [self.view[i], self.gpu[i]] + ([self.tier[i]] if self.tier else []):
+            cache.insert(keys, now)
+        self.tokens["gpu"] += gpu_hit
+        self.tokens["tier"] += tier_hit
+        self.tokens["miss"] += n - gpu_hit - tier_hit
+        eng = self.engines[i]
+        if eng.idle():
+            eng.clock = max(eng.clock, now)
+        eng.waiting.append(Job(req, now, self.copy_done(i, now, tier_hit), miss, gpu_hit + tier_hit, est_miss))
+
+    def copy_done(self, i, now, tokens):
+        """When copying `tokens` from the tier into replica i finishes (copies queue)."""
+        if tokens == 0:
+            return now
+        c = self.cost
+        self.link_free[i] = max(now, self.link_free[i]) + c["load_base"] + c["load_per_tok"] * tokens
+        return self.link_free[i]
+
+    def first_token(self, eng, job):
+        self.view[eng.i].pending -= job.est_miss
+        self.ttft.append(eng.clock - job.arrival)
+
+    def summary(self):
+        ttft = sorted(self.ttft)
+        pct = lambda q: ttft[min(len(ttft) - 1, int(q * len(ttft)))]
+        total = sum(self.tokens.values())
+        busy = [e.busy for e in self.engines]
+        return dict(gpu_hit=self.tokens["gpu"] / total, tier_hit=self.tokens["tier"] / total,
+                    p50=pct(0.5), p90=pct(0.9), p99=pct(0.99),
+                    imbalance=max(busy) / (sum(busy) / len(busy)))
+
+
+def run(arrivals, follow, policy, server="gpu", **kw):
+    """Event loop: always advance whichever comes first, the next arrival or the
+    replica furthest behind. follow(req, t_done) gives the next (time, request), if any."""
+    cluster = Cluster(policy, server, **kw)
+    order = itertools.count()  # breaks ties between events at the same time
+    queue = [(t, next(order), r) for t, r in arrivals]
+    heapq.heapify(queue)
+
+    def done(eng, job):
+        nxt = follow(job.req, eng.clock)
+        if nxt:
+            heapq.heappush(queue, (nxt[0], next(order), nxt[1]))
+
+    while queue or any(not e.idle() for e in cluster.engines):
+        busy = [e for e in cluster.engines if not e.idle()]
+        e = min(busy, key=lambda e: e.clock) if busy else None
+        if e and (not queue or e.clock < queue[0][0]):
+            e.step(cluster.first_token, done)
+        else:
+            now, _, req = heapq.heappop(queue)
+            cluster.route(now, req)
+    return cluster.summary()
+
+
 def simulate(reqs, policy, server="gpu", speed=1.0, **kw):
     """Open loop: every request arrives at its trace time / speed."""
     return run([(r.t / speed, r) for r in reqs], lambda req, t: None, policy, server, **kw)
@@ -133,104 +216,24 @@ def simulate(reqs, policy, server="gpu", speed=1.0, **kw):
 
 def simulate_agents(agents, policy, server="gpu", **kw):
     """Closed loop: each agent sends its next step `gap` seconds after the last one finishes."""
-    nxt = {id(s): (a.steps[i + 1] if i + 1 < len(a.steps) else None)
-           for a in agents for i, s in enumerate(a.steps)}
-    finish = {}
+    steps_done = [0] * len(agents)
+    finish = [0.0] * len(agents)
 
-    def follow(req, t):
-        finish[req.session] = t
-        s = nxt[id(req)]
-        return (t + s.gap, s) if s else None
+    def follow(step, t):
+        s = step.session
+        steps_done[s] += 1
+        finish[s] = t
+        if steps_done[s] < len(agents[s].steps):
+            nxt = agents[s].steps[steps_done[s]]
+            return t + nxt.gap, nxt
+        return None
 
     out = run([(a.start, a.steps[0]) for a in agents], follow, policy, server, **kw)
-    span = [finish[i] - a.start for i, a in enumerate(agents)]
-    out.update(session_mean=sum(span) / len(span), makespan=max(finish.values()),
-               steps_per_s=sum(len(a.steps) for a in agents) / max(finish.values()))
+    sessions = sorted(finish[s] - a.start for s, a in enumerate(agents))
+    out.update(session_mean=sum(sessions) / len(sessions),
+               session_p90=sessions[int(0.9 * (len(sessions) - 1))], session_max=sessions[-1],
+               steps_per_s=sum(len(a.steps) for a in agents) / max(finish))
     return out
-
-
-def run(arrivals, follow, policy, server="gpu", n=4, gpu_tokens=380_000,
-        tier_tokens=1_700_000, cap=16384, cost=COST, tier_gbps=None, kv_bytes=57344,
-        tier_eviction="lru"):
-    """Event loop: always advance whichever comes first, the next arrival or the
-    replica furthest behind. follow(req, t_done) returns the next (time, request)."""
-    gpu = [policies.Replica(gpu_tokens // BLOCK) for _ in range(n)]
-    fifo = tier_eviction == "fifo"  # gc.py deletes the oldest-written blocks (tmpfs doesn't track reads)
-    if server == "shared":
-        tier = [policies.Replica(tier_tokens // BLOCK, fifo)] * n  # one tier, n references
-    elif server == "private":
-        tier = [policies.Replica(tier_tokens // n // BLOCK, fifo) for _ in range(n)]
-    else:
-        tier = None
-    # The router's estimate of each replica, as in router.py: what it sent there,
-    # sized to the GPU cache plus any tier only that replica can read.
-    view_tokens = gpu_tokens + (tier_tokens // n if server == "private" else 0)
-    view = [policies.Replica(view_tokens // BLOCK) for _ in range(n)]
-    engines = [Engine(gpu_tokens, cost) for _ in range(n)]
-    tok = dict(gpu=0, tier=0, miss=0)
-    ttft = []
-    link_free = [0.0] * n      # each replica's host link: one tier copy at a time
-    tier_free = 0.0            # the tier itself, if its total bandwidth is limited
-    queue = [(t, i, r) for i, (t, r) in enumerate(arrivals)]
-    heapq.heapify(queue)
-    seq = len(queue)
-
-    def first_token(eng, job):
-        view[engines.index(eng)].pending -= job.est_miss
-        ttft.append(eng.clock - job.arrival)
-
-    def done(eng, job):
-        nonlocal seq
-        nxt = follow(job.req, eng.clock)
-        if nxt:
-            heapq.heappush(queue, (nxt[0], seq, nxt[1]))
-            seq += 1
-
-    def load_done(j, now, tokens):
-        """When a copy of `tokens` from the tier into replica j finishes."""
-        nonlocal tier_free
-        if tokens == 0:
-            return now
-        start = max(now, link_free[j])
-        end = start + t_load(tokens, cost)
-        if tier_gbps:  # also queue for the tier's own bandwidth
-            end = max(end, max(now, tier_free) + tokens * kv_bytes / (tier_gbps * 1e9))
-            tier_free = end
-        link_free[j] = end
-        return end
-
-    def dispatch(now, r):
-        keys = r.hash_ids  # stand-in for policies.block_keys: same chaining, cheaper
-        j = policies.choose(policy, view, keys, cap)
-        est_miss = r.input_len - min(view[j].match(keys) * BLOCK, r.input_len)
-        g = min(gpu[j].match(keys) * BLOCK, r.input_len)
-        t = max(0, min(tier[j].match(keys) * BLOCK, r.input_len) - g) if tier else 0
-        miss = max(1, r.input_len - g - t)  # vLLM always recomputes at least one token
-        view[j].pending += est_miss
-        engines[j].clock = max(engines[j].clock, now) if engines[j].idle() else engines[j].clock
-        engines[j].waiting.append(Job(r, load_done(j, now, t), miss, g + t, now, est_miss))
-        for c in [view[j], gpu[j]] + ([tier[j]] if tier else []):
-            c.insert(keys)
-        tok["gpu"] += g
-        tok["tier"] += t
-        tok["miss"] += r.input_len - g - t
-
-    while queue or any(not e.idle() for e in engines):
-        busy = [e for e in engines if not e.idle()]
-        e = min(busy, key=lambda e: e.clock) if busy else None
-        if e and (not queue or e.clock < queue[0][0]):
-            e.step(first_token, done)
-        else:
-            now, _, r = heapq.heappop(queue)
-            dispatch(now, r)
-    ttft.sort()
-    total = sum(tok.values())
-    pct = lambda q: ttft[min(len(ttft) - 1, int(q * len(ttft)))]
-    busy = [e.busy for e in engines]
-    return dict(policy=policy, server=server,
-                gpu_hit=tok["gpu"] / total, tier_hit=tok["tier"] / total,
-                p50=pct(0.5), p90=pct(0.9), p99=pct(0.99),
-                imbalance=max(busy) / (sum(busy) / n))
 
 
 ARMS = [("least", "gpu"), ("prefix", "gpu"), ("prefix_cap", "gpu"),
@@ -245,7 +248,6 @@ def main():
     ap.add_argument("--speed", type=float, nargs="+", default=[3.0, 5.0, 7.0])
     ap.add_argument("--gpu-tokens", type=int, default=380_000)
     ap.add_argument("--tier-tokens", type=int, default=1_700_000)
-    ap.add_argument("--cap", type=int, default=16384)
     ap.add_argument("--calib", nargs="*", default=[], help="calibrate.py JSONs (later ones win)")
     a = ap.parse_args()
     cost = dict(COST)
@@ -258,8 +260,7 @@ def main():
         print(f"{'policy':12s}{'server':9s}{'gpu hit':>9s}{'tier hit':>9s}{'p50 s':>8s}{'p90 s':>8s}"
               f"{'p99 s':>8s}{'imbal':>7s}")
         for p, srv in ARMS:
-            m = simulate(reqs, p, srv, speed=s, gpu_tokens=a.gpu_tokens,
-                         tier_tokens=a.tier_tokens, cap=a.cap, cost=cost)
+            m = simulate(reqs, p, srv, speed=s, gpu_tokens=a.gpu_tokens, tier_tokens=a.tier_tokens, cost=cost)
             print(f"{p:12s}{srv:9s}{m['gpu_hit']:9.1%}{m['tier_hit']:9.1%}{m['p50']:8.2f}"
                   f"{m['p90']:8.2f}{m['p99']:8.2f}{m['imbalance']:7.2f}")
 

@@ -1,0 +1,114 @@
+{
+ "made": "2026-11-05 15:46",
+ "note": "simulator predictions (GPU evicts tail-first, overhead 1.1) recorded before the GC-policy runs",
+ "rows": [
+  {
+   "policy": "least",
+   "tier_gb": 50,
+   "gc": "oldest",
+   "hits": 0.2851385125839051,
+   "session_mean": 1387.7952558729282,
+   "session_p90": 1767.8862806187751,
+   "steps_per_s": 0.6050356622464942
+  },
+  {
+   "policy": "least",
+   "tier_gb": 50,
+   "gc": "lru",
+   "hits": 0.2971498251394945,
+   "session_mean": 1368.900365652307,
+   "session_p90": 1739.4552466931145,
+   "steps_per_s": 0.6043738519151863
+  },
+  {
+   "policy": "least",
+   "tier_gb": 50,
+   "gc": "protect",
+   "hits": 0.6029587562126002,
+   "session_mean": 903.7380569906032,
+   "session_p90": 1145.1176689007364,
+   "steps_per_s": 0.8375826398538284
+  },
+  {
+   "policy": "least",
+   "tier_gb": 100,
+   "gc": "oldest",
+   "hits": 0.6354578056976095,
+   "session_mean": 833.2322374122731,
+   "session_p90": 1099.6385929751345,
+   "steps_per_s": 0.8869870564875837
+  },
+  {
+   "policy": "least",
+   "tier_gb": 100,
+   "gc": "lru",
+   "hits": 0.8069683880978398,
+   "session_mean": 550.801348585988,
+   "session_p90": 714.1293286373937,
+   "steps_per_s": 1.293980029611992
+  },
+  {
+   "policy": "least",
+   "tier_gb": 100,
+   "gc": "protect",
+   "hits": 0.8673811799173594,
+   "session_mean": 454.30594217900426,
+   "session_p90": 587.0212333854712,
+   "steps_per_s": 1.403853563833681
+  },
+  {
+   "policy": "prefix",
+   "tier_gb": 50,
+   "gc": "oldest",
+   "hits": 0.6528308220327662,
+   "session_mean": 839.4020331738457,
+   "session_p90": 1046.7716891589482,
+   "steps_per_s": 0.9141216824333361
+  },
+  {
+   "policy": "prefix",
+   "tier_gb": 50,
+   "gc": "lru",
+   "hits": 0.628735124297675,
+   "session_mean": 874.8737312219863,
+   "session_p90": 1095.3813321672117,
+   "steps_per_s": 0.8632231894983782
+  },
+  {
+   "policy": "prefix",
+   "tier_gb": 50,
+   "gc": "protect",
+   "hits": 0.686352888252548,
+   "session_mean": 787.573144464829,
+   "session_p90": 970.5813789993322,
+   "steps_per_s": 0.9838844352296069
+  },
+  {
+   "policy": "prefix",
+   "tier_gb": 100,
+   "gc": "oldest",
+   "hits": 0.7730261542905619,
+   "session_mean": 646.4054776479242,
+   "session_p90": 880.2985658117486,
+   "steps_per_s": 1.1780892554130107
+  },
+  {
+   "policy": "prefix",
+   "tier_gb": 100,
+   "gc": "lru",
+   "hits": 0.8446373257246464,
+   "session_mean": 498.0811500069515,
+   "session_p90": 679.3739508602257,
+   "steps_per_s": 1.2344555894578424
+  },
+  {
+   "policy": "prefix",
+   "tier_gb": 100,
+   "gc": "protect",
+   "hits": 0.8803515706617981,
+   "session_mean": 436.9669792920035,
+   "session_p90": 582.6200665521249,
+   "steps_per_s": 1.3900670022106785
+  }
+ ]
+}

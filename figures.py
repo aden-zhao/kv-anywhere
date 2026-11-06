@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """README figures from sweep results.
 
-    python3 figures.py results/conv_qwen25 --out docs/figures [--speed 7]
+    python3 figures.py results/conv_qwen25 --out docs/figures [--load 5]
+    python3 figures.py results/agents_qwen25 --agents
 
 ttft.png    median and p99 TTFT vs load for the four main arms
 agents.png  (--agents) mean session time and throughput vs concurrent agents
@@ -50,7 +51,7 @@ def ttft_figure(rows, out, arms):
     for ax, q, title in [(axes[0], "p50", "Median TTFT"), (axes[1], "p99", "p99 TTFT")]:
         style(ax)
         for mode, pol, label, color in arms:
-            pts = sorted((r["speed"], r[q]) for r in rows if r["mode"] == mode and r["policy"] == pol)
+            pts = sorted((r["load"], r[q]) for r in rows if r["mode"] == mode and r["policy"] == pol)
             if not pts:
                 continue
             xs, ys = zip(*pts)
@@ -68,10 +69,10 @@ def ttft_figure(rows, out, arms):
     fig.savefig(out, dpi=160, facecolor=SURFACE)
 
 
-def token_figure(rows, out, speed, arms):
+def token_figure(rows, out, load, arms):
     sel = []
     for mode, pol, label, _ in arms:
-        r = [r for r in rows if r["mode"] == mode and r["policy"] == pol and r["speed"] == speed]
+        r = [r for r in rows if r["mode"] == mode and r["policy"] == pol and r["load"] == load]
         if r:
             sel.append((label, r[0]))
     fig, ax = plt.subplots(figsize=(8, 0.5 * len(sel) + 1.2), facecolor=SURFACE)
@@ -89,7 +90,7 @@ def token_figure(rows, out, speed, arms):
     ax.set_yticks(range(len(sel)), [s[0] for s in sel], fontsize=9, color=INK)
     ax.invert_yaxis()
     ax.set_xlabel("% of prompt tokens not recomputed", color=INK2, fontsize=9)
-    ax.set_title(f"Prompt tokens served from cache (load {speed:g}x)", color=INK, fontsize=11,
+    ax.set_title(f"Prompt tokens served from cache (load {load:g}x)", color=INK, fontsize=11,
                  loc="left")
     ax.legend(frameon=False, fontsize=8, labelcolor=INK2, loc="upper right")
     ax.set_xlim(0, max(r[1]["gpu_hit"] + r[1]["tier_hit"] for r in sel) * 100 * 1.15)
@@ -110,7 +111,7 @@ def agents_figure(rows, out):
                                  (axes[1], "steps_per_s", "Throughput", "agent steps per second")]:
         style(ax)
         for mode, pol, label, color in AGENT_ARMS:
-            pts = sorted((r["speed"], r[key]) for r in rows if r["mode"] == mode and r["policy"] == pol)
+            pts = sorted((r["load"], r[key]) for r in rows if r["mode"] == mode and r["policy"] == pol)
             if pts:
                 xs, ys = zip(*pts)
                 ax.plot(xs, ys, color=color, linewidth=2, marker="o", markersize=5, label=label,
@@ -129,7 +130,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dirs", nargs="+")
     ap.add_argument("--out", default="docs/figures")
-    ap.add_argument("--speed", type=float, default=None)
+    ap.add_argument("--load", type=float, default=None, help="trace speedup for tokens.png")
     ap.add_argument("--agents", action="store_true", help="agent sweep: draw agents.png only")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
@@ -138,9 +139,9 @@ def main():
         agents_figure(rows, f"{a.out}/agents.png")
         print("wrote", a.out)
         return
-    speed = a.speed or max(r["speed"] for r in rows)
+    load = a.load or max(r["load"] for r in rows)
     ttft_figure(rows, f"{a.out}/ttft.png", ARMS)
-    token_figure(rows, f"{a.out}/tokens.png", speed, ARMS)
+    token_figure(rows, f"{a.out}/tokens.png", load, ARMS)
     print("wrote", a.out)
 
 

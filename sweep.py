@@ -66,14 +66,26 @@ def serve_cmd(a, mode, i):
     if mode == "gpu":
         return cmd
     root = tier_dirs(mode, a.n)[i if mode == "private" else 0]
+    files = ({"type": "ReadStampedTier", "module_path": "kvtier", "root_dir": root} if a.read_stamps
+             else {"type": "fs", "root_dir": root})  # kvtier.py records reads for tier_gc.py
     tier = {"kv_connector": "OffloadingConnector", "kv_role": "kv_both",
             "kv_load_failure_policy": "recompute",  # a block the GC just deleted is recomputed
             "kv_connector_extra_config": {
                 "spec_name": "TieringOffloadingSpec",
                 "cpu_bytes_to_use": int(a.cpu_gb * 1e9),  # pinned staging area on the host
                 "block_size": a.chunk,                    # tokens per tier file
-                "secondary_tiers": [{"type": "fs", "root_dir": root}]}}
+                "secondary_tiers": [files]}}
     return cmd + ["--kv-transfer-config", json.dumps(tier)]
+
+
+def serve_env(a, i):
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(i), VLLM_SERVER_DEV_MODE="1",  # dev mode: cache reset
+               PYTHONPATH=HERE + os.pathsep + os.environ.get("PYTHONPATH", ""))  # for kvtier.py
+    if a.context > 32768:
+        # vLLM doesn't derive the longer limit from the YaRN override. Prompts are random
+        # tokens, so output quality doesn't matter; the compute is the same either way.
+        env["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
+    return env
 
 
 def responding(p):
@@ -110,13 +122,8 @@ def replicas(a, mode, logdir):
     procs = []
     try:
         for i in range(a.n):
-            env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(i), VLLM_SERVER_DEV_MODE="1")
-            if a.context > 32768:
-                # vLLM doesn't derive the longer limit from the YaRN override. Prompts are random
-                # tokens, so output quality doesn't matter; the compute is the same either way.
-                env["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
             log = open(f"{logdir}/{mode}_server{i}.log", "w")
-            procs.append(subprocess.Popen(serve_cmd(a, mode, i), env=env, stdout=log,
+            procs.append(subprocess.Popen(serve_cmd(a, mode, i), env=serve_env(a, i), stdout=log,
                                           stderr=subprocess.STDOUT, start_new_session=True))
         t = time.time()
         for i, p in enumerate(procs):
@@ -133,14 +140,14 @@ def replicas(a, mode, logdir):
 
 
 @contextlib.contextmanager
-def helpers(a, mode, logdir):
+def helpers(a, mode, logdir, gc_policy, tier_gb):
     """The router, plus the tier's GC when there is a tier."""
     backends = [f"http://localhost:{port(i)}" for i in range(a.n)]
     cmds = [[sys.executable, f"{HERE}/router.py", "--backends", *backends]]
     dirs = tier_dirs(mode, a.n)
     if dirs:
-        cmds.append([sys.executable, f"{HERE}/gc.py", "--budget-gb", str(a.tier_gb / len(dirs)),
-                     "--interval", "30" if mode.startswith("lustre") else "1", *dirs])
+        cmds.append([sys.executable, f"{HERE}/tier_gc.py", "--budget-gb", str(tier_gb / len(dirs)),
+                     "--policy", gc_policy, "--interval", "30" if mode.startswith("lustre") else "1", *dirs])
     log = open(f"{logdir}/{mode}_router.log", "w")
     procs = [subprocess.Popen(c, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
              for c in cmds]
@@ -169,23 +176,25 @@ def kv_bytes_per_token(model):
     return c.num_hidden_layers * 2 * c.num_key_value_heads * head_dim * 2  # K and V, bf16
 
 
-def run(a, mode, policy, load, kv, backends):
-    """One replay. `load` is the speedup for Mooncake traces, the number of agents for agents."""
+def replay(a, mode, policy, load, kv, backends, gc_policy, tier_gb):
+    """One run. `load` is the speedup for Mooncake traces, the number of agents for agents."""
     clear_caches(a, mode)
     # The router guesses what each replica caches: its GPU cache, plus the private
     # tier that only that replica can read. (A shared tier is everyone's.)
     blocks = kv // 512
     if mode == "private":
-        blocks += int(a.tier_gb / a.n * 1e9 / kv_bytes_per_token(a.model) / 512)
+        blocks += int(tier_gb / a.n * 1e9 / kv_bytes_per_token(a.model) / 512)
     requests.post(ROUTER + "/config", json={
         "policy": policy, "cap": a.cap, "capacity_blocks": blocks}).raise_for_status()
     if a.trace == "agents":
         name, knob = f"agents_n{load:g}_{mode}_{policy}", ["--agents", str(int(load))]
     else:
         name, knob = f"{a.trace}_f{a.frac}_{mode}_{policy}_s{load:g}", ["--speed", str(load)]
+    if len(a.gc_policies) > 1 or len(a.tier_gbs or []) > 1:
+        name += f"_{gc_policy}_{tier_gb:g}gb"
     subprocess.run([sys.executable, f"{HERE}/replay.py", "--backends", *backends, "--model", a.model,
                     "--trace", a.trace, "--frac", str(a.frac), "--dur", str(a.dur), *knob,
-                    "--mode", mode, "--policy", policy, "--tier-gb", str(a.tier_gb),
+                    "--mode", mode, "--policy", policy, "--tier-gb", str(tier_gb), "--gc", gc_policy,
                     "--out", f"{a.out}/{name}.csv"])
 
 
@@ -206,6 +215,9 @@ def main():
     ap.add_argument("--cpu-gb", type=float, default=4, help="per-replica CPU staging tier")
     ap.add_argument("--chunk", type=int, default=256, help="tokens per tier file")
     ap.add_argument("--tier-gb", type=float, default=100, help="total tier budget")
+    ap.add_argument("--tier-gbs", type=float, nargs="+", help="several tier budgets, one run each")
+    ap.add_argument("--gc-policies", nargs="+", default=["oldest"], choices=["oldest", "lru", "protect"])
+    ap.add_argument("--read-stamps", action="store_true", help="use kvtier.ReadStampedTier (for lru/protect)")
     ap.add_argument("--calibrate", action="store_true", help="only run calibrate.py (shared config)")
     ap.add_argument("--calib-args", default="", help="extra arguments for calibrate.py")
     ap.add_argument("--calib-mode", default="shared", help="tier to calibrate loads from")
@@ -221,11 +233,15 @@ def main():
                             "--out", f"{a.out}/calib_{a.calib_mode}.json", *a.calib_args.split()], check=True)
         return
 
+    loads = a.agents if a.trace == "agents" else a.speeds
     for mode in a.modes:
-        with replicas(a, mode, logdir) as kv, helpers(a, mode, logdir) as backends:
-            for policy in a.policies or POLICIES[mode]:
-                for load in (a.agents if a.trace == "agents" else a.speeds):
-                    run(a, mode, policy, load, kv, backends)
+        with replicas(a, mode, logdir) as kv:
+            for gc_policy in a.gc_policies:
+                for tier_gb in a.tier_gbs or [a.tier_gb]:
+                    with helpers(a, mode, logdir, gc_policy, tier_gb) as backends:
+                        for policy in a.policies or POLICIES[mode]:
+                            for load in loads:
+                                replay(a, mode, policy, load, kv, backends, gc_policy, tier_gb)
 
 
 if __name__ == "__main__":

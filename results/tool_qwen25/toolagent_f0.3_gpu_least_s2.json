@@ -69,5 +69,7 @@
    "vllm:prompt_tokens_total": 1660526.0,
    "vllm:generation_tokens_total": 37073.0
   }
- ]
+ ],
+ "mode": "gpu",
+ "policy": "least"
 }

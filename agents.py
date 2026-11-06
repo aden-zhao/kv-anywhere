@@ -34,8 +34,7 @@ class Step:
     output_len: int
     hash_ids: list
     gap: float          # seconds between the previous step finishing and this one starting
-    session: int = 0
-    t: float = 0.0      # filled in at replay time
+    session: int = 0    # index of its agent in the workload
 
 
 @dataclass
@@ -69,7 +68,7 @@ def load_day(day="2026-09-01", min_peak=32768, max_len=131072, min_steps=10):
     if os.path.exists(cache):
         return [Agent(a["sid"], a["start"], [Step(**s) for s in a["steps"]]) for a in json.load(open(cache))]
     import zstandard
-    agents, t0 = [], None
+    agents = []
     with open(_download(day), "rb") as f:
         for line in io.TextIOWrapper(zstandard.ZstdDecompressor().stream_reader(f), encoding="utf-8"):
             s = json.loads(line)
